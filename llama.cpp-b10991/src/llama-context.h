@@ -201,6 +201,8 @@ struct llama_context {
             ggml_opt_result_t       result_train,
             ggml_opt_result_t       result_eval,
             int64_t                 idata_split,
+            int64_t                 idata_start,
+            int64_t                 ubatch_start,
             ggml_opt_epoch_callback callback_train,
             ggml_opt_epoch_callback callback_eval);
 
@@ -214,7 +216,8 @@ struct llama_context {
             bool                             train,
             int64_t                          idata_in_loop,
             int64_t                          ndata_in_loop,
-            int64_t                          t_loop_start);
+            int64_t                          t_loop_start,
+            int64_t                          ubatch_skip);
 
 private:
     //

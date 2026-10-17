@@ -156,6 +156,13 @@ extern "C" {
 
         // only GGML_OPT_OPTIMIZER_TYPE_ADAMW needs m, v momenta per parameter tensor
         enum ggml_opt_optimizer_type optimizer;
+
+        // if true, every call to ggml_opt_eval appends the per-datapoint predictions to the
+        // ggml_opt_result, so that they can be read back with ggml_opt_result_pred().
+        // This is only needed for inference-style evaluation; for training it makes the
+        // result grow linearly with the number of evaluated micro-batches (several GiB for
+        // a large corpus), so it can be disabled to keep the memory bounded.
+        bool collect_pred;
     };
 
     // get parameters for an optimization context with defaults set where possible
@@ -169,6 +176,11 @@ extern "C" {
 
     // set gradients to zero, initialize loss, and optionally reset the optimizer
     GGML_API void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer);
+
+    // reset the gradient-accumulation phase counter without touching the optimizer state.
+    // used after a forward-only evaluation (e.g. rebuilding the KV cache when resuming)
+    // so that it does not shift when the next optimizer step is taken.
+    GGML_API void ggml_opt_reset_opt_i(ggml_opt_context_t opt_ctx);
 
     GGML_API bool ggml_opt_static_graphs(ggml_opt_context_t opt_ctx); // whether the graphs are allocated_statically
 

@@ -8,6 +8,21 @@
 
 ---
 
+## 0. 控制台统一启动画面（Build 24）
+
+所有控制台工具启动时打印同一套 Lumina-Engine 启动画面（ASCII logo + Build 号 + 项目链接）：
+
+| 文件 | 类型 | 说明 |
+|------|------|------|
+| `common/build-info.cpp.in` / `.h` | 修改 | 新增 `lumina_ascii_logo()`；`llama_print_lumina_banner()` 输出完整启动画面；Build 号升至 **Build 24** |
+| `common/arg.cpp` | 修改 | `common_params_parse()` 成功后统一打印启动画面（`cli` 除外，由 CLI 打印带模型信息与命令列表的横幅） |
+| `tools/cli/cli-context.cpp` | 修改 | 删除本地 logo 副本，改用共享 `lumina_ascii_logo()` |
+| `tools/server/server.cpp`、`tools/cvector-generator/cvector-generator.cpp` | 修改 | 移除重复的横幅打印 |
+| `tools/gguf-split/gguf-split.cpp` | 修改 | 显式打印启动画面，`--version` 复用 `llama_print_build_info()` |
+| `tools/rpc/rpc-server.cpp` / `tools/rpc/CMakeLists.txt` | 修改 | 不链接 `llama-common`，用编译期 `LUMINA_RPC_BUILD_NUMBER` + 同一段 ASCII art 打印同一画面 |
+
+---
+
 ## 1. `ggml/src/ggml-cpu/q1t.cpp`（新增，约 480 行）
 
 Q1_0 专用推理内核。核心内容：
@@ -399,7 +414,7 @@ MoE 走算子 offload 反而慢 ~30%（143 vs 207 t/s），关闭后恢复。
 | `bench/build_haswell.bat` / `bench/build_x64.bat` | 单变体增量编译（开发用） |
 | `bench/bench_lut2.cpp` | Q1LUT 独立内核微基准（含正确性校验） |
 
-**约定**：`Lumina-Engine-Bin` 是唯一的交付目录；旧入口 `D:\Lumina-Engine\llama` 已删除。
+**约定**：`Lumina-Engine-Bin` 是唯一的交付目录；旧入口 `C:\Lumina-Engine\llama` 已删除。
 
 ---
 

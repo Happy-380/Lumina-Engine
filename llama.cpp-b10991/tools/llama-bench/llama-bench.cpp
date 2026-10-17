@@ -2229,6 +2229,9 @@ int llama_bench(int argc, char ** argv) {
 
     cmd_params params = parse_cmd_params(argc, argv);
 
+    // Lumina-Engine: llama-bench parses its own arguments, so print the shared startup screen here.
+    llama_print_lumina_banner();
+
     auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
     if (!cpu_dev) {
         fprintf(stderr, "%s: error: CPU backend is not loaded\n", __func__);

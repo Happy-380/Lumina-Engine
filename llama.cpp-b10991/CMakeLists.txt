@@ -152,7 +152,7 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/common.cmake)
 
 if (NOT DEFINED LLAMA_BUILD_NUMBER)
     # Lumina-Engine release identity (independent of the upstream git history)
-    set(LLAMA_BUILD_NUMBER        19)
+    set(LLAMA_BUILD_NUMBER        24)
 endif()
 if (NOT DEFINED LLAMA_BUILD_COMMIT)
     set(LLAMA_BUILD_COMMIT        ${BUILD_COMMIT})

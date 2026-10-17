@@ -82,7 +82,7 @@ int main(int argc, char ** argv) {
     ggml_opt_result_t result_eval  = ggml_opt_result_init();
 
     for (lr.epoch = 0; lr.epoch < lr.epochs; ++lr.epoch) {
-        llama_opt_epoch(ctx, dataset, result_train, result_eval, idata_split,
+        llama_opt_epoch(ctx, dataset, result_train, result_eval, idata_split, /*idata_start =*/ 0, /*ubatch_start =*/ 0,
                         ggml_opt_epoch_callback_progress_bar, ggml_opt_epoch_callback_progress_bar);
         fprintf(stderr, "\n");
 

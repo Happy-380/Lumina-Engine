@@ -13,10 +13,10 @@ distributions follow the directory described here.
 The final delivery directory is fixed to:
 
 ```
-D:\Lumina-Engine\Lumina-Engine-Bin          (equivalently: <repo root>\Lumina-Engine-Bin)
+C:\Lumina-Engine\Lumina-Engine-Bin          (equivalently: <repo root>\Lumina-Engine-Bin)
 ```
 
-- It sits next to the source directory `llama.cpp-b10991\`, under the repo root `D:\Lumina-Engine\`.
+- It sits next to the source directory `llama.cpp-b10991\`, under the repo root `C:\Lumina-Engine\`.
 - **55 files** in total: 14 CPU backend DLLs + all tools + runtime libraries.
 - Assembly layout: **Clang build as the base (14 variants + tools + libomp), then the 9 MSVC
   variants overwrite their clang counterparts.**
@@ -25,7 +25,7 @@ D:\Lumina-Engine\Lumina-Engine-Bin          (equivalently: <repo root>\Lumina-En
   merely **build intermediates**, not deliverables.
 
 ```bat
-cd D:\Lumina-Engine\Lumina-Engine-Bin
+cd C:\Lumina-Engine\Lumina-Engine-Bin
 Lumina-Engine-bench.exe -m ..\Bonsai-8B.gguf -p 512 -n 128 -t 6
 Lumina-Engine-cli.exe   -m ..\Bonsai-8B.gguf -p "The capital of France is" -n 8 -t 6
 ```
@@ -37,7 +37,7 @@ Lumina-Engine-cli.exe   -m ..\Bonsai-8B.gguf -p "The capital of France is" -n 8 
 The repo root provides a single entry-point script:
 
 ```bat
-D:\Lumina-Engine\build-bin.bat
+C:\Lumina-Engine\build-bin.bat
 ```
 
 It runs three steps and aborts on the first failure:
@@ -46,7 +46,7 @@ It runs three steps and aborts on the first failure:
 |:--:|------|------|
 | 1 | `bench\build_all_msvc.bat` | Build `llama.cpp-b10991\build-release` (**9 MSVC variants** + tools) |
 | 2 | `bench\build_all_clang.bat` | Build `llama.cpp-b10991\build-clang` (**14 variants** + tools + libomp) |
-| 3 | `bench\assemble_bin.bat` | Assemble into `D:\Lumina-Engine\Lumina-Engine-Bin` |
+| 3 | `bench\assemble_bin.bat` | Assemble into `C:\Lumina-Engine\Lumina-Engine-Bin` |
 
 > If you only changed sources and want to re-assemble, run `bench\assemble_bin.bat` alone
 > (it deletes and recreates the delivery directory first).
@@ -58,7 +58,7 @@ It runs three steps and aborts on the first failure:
 Key variables inside the script:
 
 ```bat
-set "ROOT=%~dp0.."                                  REM repo root = D:\Lumina-Engine
+set "ROOT=%~dp0.."                                  REM repo root = C:\Lumina-Engine
 set "SRC_CLANG=%ROOT%\llama.cpp-b10991\build-clang\bin"
 set "SRC_MSVC =%ROOT%\llama.cpp-b10991\build-release\bin"
 set "DST=%ROOT%\Lumina-Engine-Bin"                  REM delivery directory
@@ -137,7 +137,7 @@ Key options:
 ## 5. Directory / script overview
 
 ```
-D:\Lumina-Engine\
+C:\Lumina-Engine\
 ├─ build-bin.bat                     # ★ one-click: MSVC + Clang build + assemble into Lumina-Engine-Bin
 ├─ configure-release.bat             # configure MSVC tree build-release (9 variants)
 ├─ build-release.bat                 # incremental build of build-release
@@ -160,7 +160,7 @@ D:\Lumina-Engine\
 ## 6. Conventions (important)
 
 1. **All future build output goes to `.\Lumina-Engine-Bin` only.** Do not add a second delivery directory.
-2. The old `D:\Lumina-Engine\llama` entry **has been deleted**; it is superseded by `Lumina-Engine-Bin`.
+2. The old `C:\Lumina-Engine\llama` entry **has been deleted**; it is superseded by `Lumina-Engine-Bin`.
 3. `build-release` / `build-clang` are **build intermediates** consumed by `assemble_bin.bat`; they are not deliverables.
 4. The legacy single-variant `build\` tree was cleaned up. `configure.bat` + `build.bat` remain for quick
    local development only and **do not participate in delivery**.
@@ -172,13 +172,15 @@ D:\Lumina-Engine\
 ## 7. Post-build verification
 
 ```bat
-cd D:\Lumina-Engine\Lumina-Engine-Bin
+cd C:\Lumina-Engine\Lumina-Engine-Bin
 
-REM 1) Banner: should show Build 8 (Based on llama.cpp b-10991)
+REM 1) Banner: should show Build 24 (Based on llama.cpp b-10991)
 Lumina-Engine-cli.exe --version
+Lumina-Engine-server.exe --help
+Lumina-Engine-train.exe --version
 Lumina-Engine-cli.exe -m ..\Bonsai-8B.gguf -p "The capital of France is" -n 8 -t 6 --temp 0
 
-REM 2) Confirm the file count (should be 55)
+REM 2) Confirm the file count (should be 54)
 dir /b | find /c /v ""
 
 REM 3) Confirm Q1LUT is active (AVX2 machines)
@@ -190,9 +192,10 @@ set GGML_Q1_LUT_DEBUG=
 
 Expected:
 
-- Banner shows `Build 8 (Based on llama.cpp b-10991)`;
+- Banner shows `Build 24 (Based on llama.cpp b-10991)`; every console (`cli` / `server` / `train`
+  / ...) prints the same ASCII logo + build number + project links at startup;
 - `-p "The capital of France is"` prints `Paris.`;
-- 55 files in the delivery directory;
+- 54 files in the delivery directory;
 - Q1LUT is enabled by default on AVX2 machines (`q1lut alloc` logs; disable with `GGML_Q1_LUT=0`).
 
 ---

@@ -255,10 +255,10 @@ python tools\lumina_gguf_unpack.py verify model.gguf.lumina model.gguf
 
 ```bat
 REM 打印 GGUF 元数据键值
-python read_gguf.py <模型.gguf>
+python tools\read_gguf.py <模型.gguf>
 
 REM 打印每个张量的名称 / 类型 / 维度，以及类型计数
-python tensors.py <模型.gguf>
+python tools\tensors.py <模型.gguf>
 ```
 
 > 这两个脚本用于查看普通 GGUF（或还原后的文件）；直接读 `LGGC` 容器没有意义，请先

@@ -273,10 +273,10 @@ python tools\lumina_gguf_unpack.py verify model.gguf.lumina model.gguf
 
 ```bat
 REM print GGUF metadata key/value pairs
-python read_gguf.py <model.gguf>
+python tools\read_gguf.py <model.gguf>
 
 REM print each tensor's name / type / dims, plus type counts
-python tensors.py <model.gguf>
+python tools\tensors.py <model.gguf>
 ```
 
 > These two read a plain GGUF (or a restored file); reading an `LGGC` container directly is

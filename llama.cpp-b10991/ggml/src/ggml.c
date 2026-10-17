@@ -6775,6 +6775,7 @@ static void ggml_compute_backward(
     struct ggml_tensor * tensor = cgraph->nodes[i];
     struct ggml_tensor * grad   = ggml_graph_get_grad(cgraph, tensor);
 
+
     if (!grad) {
         return;
     }
@@ -6782,6 +6783,7 @@ static void ggml_compute_backward(
     struct ggml_tensor * src0 = tensor->src[0];
     struct ggml_tensor * src1 = tensor->src[1];
     struct ggml_tensor * src2 = tensor->src[2];
+    struct ggml_tensor * src3 = tensor->src[3]; // only used by the tagged attention matmul
     struct ggml_hash_set * hash_set = &cgraph->visited_hash_set;
     const size_t isrc0 = src0 ? ggml_hash_find(hash_set, src0) : (size_t) -1;
     const size_t isrc1 = src1 ? ggml_hash_find(hash_set, src1) : (size_t) -1;
@@ -6952,6 +6954,78 @@ static void ggml_compute_backward(
             }
         } break;
         case GGML_OP_MUL_MAT: {
+            // Memory-efficient attention. When src[2]/src[3] are set this is the attention
+            // output matmul tagged by llm_graph_context::build_attn_mha:
+            //   src[0] = v, src[1] = softmax output, src[2] = k, src[3] = q, src[4] = mask
+            // The default path would differentiate the stored softmax, which forces the full
+            // [n_ctx, n_ubatch, n_head] activation of every layer to stay alive until its
+            // backward runs (O(n_layer * n_ctx)). Recomputing the scores + softmax here keeps
+            // only one layer's worth live at a time. Numerically identical to the default
+            // path because the exact same ops run on the exact same inputs.
+            if (src2 != NULL && src3 != NULL) {
+                struct ggml_tensor * v    = src0;
+                struct ggml_tensor * k    = src2;
+                struct ggml_tensor * q    = src3;
+                struct ggml_tensor * mask = tensor->src[4];
+
+                const size_t isrc3 = ggml_hash_find(hash_set, src3);
+                const bool src3_needs_grads = isrc3 != GGML_HASHSET_FULL &&
+                    ggml_bitset_get(hash_set->used, isrc3) && grads_needed[isrc3];
+
+                float scale    = 1.0f;
+                float max_bias = 0.0f;
+                if (src1 != NULL) {
+                    memcpy(&scale,    (const float *) src1->op_params + 0, sizeof(float));
+                    memcpy(&max_bias, (const float *) src1->op_params + 1, sizeof(float));
+                }
+
+                struct ggml_tensor * kq = ggml_mul_mat(ctx, k, q);
+                ggml_prec_set_acc(kq, GGML_PREC_F32);
+                struct ggml_tensor * sm = ggml_soft_max_ext(ctx, kq, mask, scale, max_bias);
+
+                // grad_v  = out_prod(sm, grad)                : [n_kv, d]
+                // grad_sm = out_prod(v, transpose(grad))       : [n_kv, n_tok]
+                struct ggml_tensor * grad_sm = ggml_out_prod(ctx, v, ggml_transpose(ctx, grad));
+                struct ggml_tensor * grad_kq = ggml_soft_max_ext_back(ctx, grad_sm, sm, scale, max_bias);
+
+                if (src0_needs_grads) {
+                    struct ggml_tensor * tmp = ggml_out_prod(ctx, sm, grad);
+                    if (!ggml_are_same_shape(tmp, v)) {
+                        GGML_ASSERT(tmp->ne[0] == v->ne[0]);
+                        GGML_ASSERT(tmp->ne[1] == v->ne[1]);
+                        GGML_ASSERT(tmp->ne[3] == 1);
+
+                        const int64_t nr2 = tmp->ne[2] / v->ne[2];
+                        const size_t nb2 = tmp->nb[2] * nr2;
+                        const size_t nb3 = tmp->nb[2];
+
+                        tmp = ggml_view_4d(ctx, tmp, v->ne[0], v->ne[1], v->ne[2], nr2, tmp->nb[1], nb2, nb3, 0);
+                        tmp = ggml_repeat_back(ctx, tmp, v);
+                    }
+                    ggml_add_or_set(ctx, cgraph, isrc0, tmp);
+                }
+                if (src2_needs_grads) {
+                    struct ggml_tensor * tmp = ggml_out_prod(ctx, q, grad_kq);
+                    if (!ggml_are_same_shape(tmp, k)) {
+                        GGML_ASSERT(tmp->ne[0] == k->ne[0]);
+                        GGML_ASSERT(tmp->ne[1] == k->ne[1]);
+                        GGML_ASSERT(tmp->ne[3] == 1);
+
+                        const int64_t nr2 = tmp->ne[2] / k->ne[2];
+                        const size_t nb2 = tmp->nb[2] * nr2;
+                        const size_t nb3 = tmp->nb[2];
+
+                        tmp = ggml_view_4d(ctx, tmp, k->ne[0], k->ne[1], k->ne[2], nr2, tmp->nb[1], nb2, nb3, 0);
+                        tmp = ggml_repeat_back(ctx, tmp, k);
+                    }
+                    ggml_add_or_set(ctx, cgraph, isrc2, tmp);
+                }
+                if (src3_needs_grads) {
+                    ggml_add_or_set(ctx, cgraph, isrc3, ggml_out_prod(ctx, k, ggml_transpose(ctx, grad_kq)));
+                }
+                break;
+            }
+
             // https://cs231n.github.io/optimization-2/#staged
             // # forward pass
             // s0 = np.random.randn(5, 10)
@@ -7315,9 +7389,12 @@ static void ggml_compute_backward(
         } //break;
     }
 
-    GGML_ASSERT(!src0_needs_grads || ggml_are_same_shape(src0, cgraph->grads[isrc0]));
-    GGML_ASSERT(!src1_needs_grads || ggml_are_same_shape(src1, cgraph->grads[isrc1]));
-    GGML_ASSERT(!src2_needs_grads || ggml_are_same_shape(src2, cgraph->grads[isrc2]));
+    // a source that needs gradients does not necessarily have one: an op may choose not to
+    // propagate to it (e.g. the memory-efficient attention backward recomputes instead of
+    // storing the softmax, so it never sets a gradient for the softmax tensor)
+    GGML_ASSERT(!src0_needs_grads || cgraph->grads[isrc0] == NULL || ggml_are_same_shape(src0, cgraph->grads[isrc0]));
+    GGML_ASSERT(!src1_needs_grads || cgraph->grads[isrc1] == NULL || ggml_are_same_shape(src1, cgraph->grads[isrc1]));
+    GGML_ASSERT(!src2_needs_grads || cgraph->grads[isrc2] == NULL || ggml_are_same_shape(src2, cgraph->grads[isrc2]));
 }
 
 static size_t ggml_visit_parents_graph(struct ggml_cgraph * cgraph, struct ggml_tensor * node, bool compute) {

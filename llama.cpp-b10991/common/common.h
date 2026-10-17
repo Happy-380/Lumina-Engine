@@ -628,9 +628,10 @@ struct common_params {
     std::string dataset_chat_template;    // optional chat template override for chat records
     int32_t     dataset_max_tokens = 0;   // max tokens loaded per dataset file (0 = unlimited)
     int32_t     dataset_limit      = 0;   // max records loaded per dataset file (0 = unlimited)
+    int32_t     dataset_stride     = 0;   // datapoint window stride (0 = n_ctx/2 = 50% overlap)
     bool        mask_history       = true; // chat records: train only on assistant/content turns
     int32_t     cpu_cores          = 0;   // CPU threads used for training (0 = all available)
-    int32_t     save_every_steps   = 500; // save a checkpoint every N optimizer steps (0 = disabled)
+    int32_t     save_every_steps   = 500; // save a checkpoint every N training micro-batches (0 = disabled)
     int32_t     save_every_epochs  = 1;   // save a checkpoint every N epochs (0 = disabled)
     int32_t     keep_last          = 0;   // keep only the last N checkpoints (0 = keep all)
     std::string checkpoint_dir;           // checkpoint directory (default: directory of --out-file)

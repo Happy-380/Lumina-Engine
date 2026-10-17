@@ -47,8 +47,18 @@
 #include <filesystem>
 #include <fstream>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
+
+#if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#else
+#  include <fcntl.h>
+#  include <sys/mman.h>
+#  include <unistd.h>
+#endif
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267)  // possible loss of data
@@ -99,6 +109,162 @@ struct lumina_token_stream {
     int64_t                  n_text = 0;
     int64_t                  n_chat = 0;
     int64_t                  n_bad  = 0;
+};
+
+// A read-only, pageable view of one token stream. A large `std::vector<llama_token>` is
+// anonymous private memory: when the machine runs short of RAM the OS can only reclaim it
+// by writing it to swap. Training the stage-1 corpus keeps ~170 M tokens (hundreds of MiB,
+// and the vector capacity can be up to 2x that) live for the whole run. Backing the stream
+// with a temp file and mapping it instead makes the pages clean and evictable, so a
+// memory-constrained machine stays out of swap and simply re-faults them from the page
+// cache. The data seen by the trainer is byte-for-byte identical.
+struct lumina_stream_view {
+    const int32_t * tokens   = nullptr;
+    const uint8_t * mask     = nullptr;
+    int64_t         n_tokens = 0;
+
+    // mapping state (empty when the view points at an in-memory fallback)
+    void *   map_base  = nullptr;
+    size_t   map_bytes = 0;
+    fs::path map_path;
+
+#if defined(_WIN32)
+    HANDLE file_handle = INVALID_HANDLE_VALUE;
+    HANDLE map_handle  = nullptr;
+#endif
+
+    lumina_stream_view() = default;
+    lumina_stream_view(const lumina_stream_view &) = delete;
+    lumina_stream_view & operator=(const lumina_stream_view &) = delete;
+    ~lumina_stream_view() { unmap(); }
+
+    // point at the in-memory stream; used as a fallback when mapping is unavailable
+    void use_memory(const lumina_token_stream & s) {
+        tokens   = (const int32_t *) s.tokens.data();
+        mask     = s.trainable.empty() ? nullptr : s.trainable.data();
+        n_tokens = (int64_t) s.tokens.size();
+    }
+
+    bool is_mapped() const { return map_base != nullptr; }
+
+    // Serialise the stream to `dir/tag.stream.bin` and map it read-only. On any failure the
+    // view silently falls back to pointing at the in-memory vectors (return false).
+    bool map_stream(const lumina_token_stream & s, const fs::path & dir, const std::string & tag) {
+        use_memory(s);
+
+        const size_t n = s.tokens.size();
+        if (n == 0) {
+            return false;
+        }
+
+        const size_t tok_bytes  = n * sizeof(int32_t);
+        const size_t mask_bytes = s.trainable.size();
+        const size_t mask_off   = (tok_bytes + 63) & ~(size_t) 63; // keep the mask aligned
+        const size_t total      = mask_off + mask_bytes;
+
+        std::error_code ec;
+        fs::create_directories(dir, ec);
+        if (ec) {
+            return false;
+        }
+
+        const fs::path path = dir / (tag + ".stream.bin");
+        map_path = path; // so a failure after this point is cleaned up by unmap()
+
+        {
+            std::ofstream of(path, std::ios::binary | std::ios::trunc);
+            if (!of) {
+                unmap();
+                return false;
+            }
+            of.write((const char *) s.tokens.data(), (std::streamsize) tok_bytes);
+            if (mask_bytes > 0) {
+                static const char zeros[64] = { 0 };
+                const size_t pad = mask_off - tok_bytes;
+                if (pad > 0) {
+                    of.write(zeros, (std::streamsize) pad);
+                }
+                of.write((const char *) s.trainable.data(), (std::streamsize) mask_bytes);
+            }
+            if (!of) {
+                unmap();
+                return false;
+            }
+        }
+
+#if defined(_WIN32)
+        file_handle = CreateFileW(path.wstring().c_str(), GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (file_handle == INVALID_HANDLE_VALUE) {
+            file_handle = INVALID_HANDLE_VALUE;
+            unmap();
+            return false;
+        }
+        map_handle = CreateFileMappingA(file_handle, nullptr, PAGE_READONLY, 0, 0, nullptr);
+        if (map_handle == nullptr) {
+            CloseHandle(file_handle);
+            file_handle = INVALID_HANDLE_VALUE;
+            unmap();
+            return false;
+        }
+        void * base = MapViewOfFile(map_handle, FILE_MAP_READ, 0, 0, 0);
+        if (base == nullptr) {
+            CloseHandle(map_handle);
+            map_handle = nullptr;
+            CloseHandle(file_handle);
+            file_handle = INVALID_HANDLE_VALUE;
+            unmap();
+            return false;
+        }
+#else
+        const int fd = open(path.string().c_str(), O_RDONLY);
+        if (fd < 0) {
+            unmap();
+            return false;
+        }
+        void * base = mmap(nullptr, total, PROT_READ, MAP_PRIVATE, fd, 0);
+        close(fd);
+        if (base == MAP_FAILED) {
+            unmap();
+            return false;
+        }
+#endif
+
+        map_base  = base;
+        map_bytes = total;
+        tokens    = (const int32_t *) base;
+        mask      = mask_bytes > 0
+                  ? (const uint8_t *) ((const char *) base + mask_off)
+                  : nullptr;
+
+        return true;
+    }
+
+    void unmap() {
+        if (map_base != nullptr) {
+#if defined(_WIN32)
+            UnmapViewOfFile(map_base);
+#else
+            munmap(map_base, map_bytes);
+#endif
+            map_base = nullptr;
+        }
+#if defined(_WIN32)
+        if (map_handle != nullptr) {
+            CloseHandle(map_handle);
+            map_handle = nullptr;
+        }
+        if (file_handle != INVALID_HANDLE_VALUE) {
+            CloseHandle(file_handle);
+            file_handle = INVALID_HANDLE_VALUE;
+        }
+#endif
+        if (!map_path.empty()) {
+            std::error_code ec;
+            fs::remove(map_path, ec);
+            map_path.clear();
+        }
+    }
 };
 
 static void lumina_append(lumina_token_stream & out, const std::vector<llama_token> & toks, bool trainable) {
@@ -240,30 +406,37 @@ static bool lumina_load_dataset(
 // (standard next-token prediction); masked positions get the sentinel label -1.
 static ggml_opt_dataset_t lumina_dataset_init(
         llama_context *              ctx,
-        const lumina_token_stream &  train,
-        const lumina_token_stream *  val,
+        const lumina_stream_view &   train,
+        const lumina_stream_view *   val,
         float                        val_split,
+        int64_t                      stride_opt,
         int64_t &                    idata_split) {
     const int64_t ne_datapoint = llama_n_ctx(ctx);
-    const int64_t stride       = std::max<int64_t>(1, ne_datapoint / 2);
+    // Default (stride_opt == 0): overlap consecutive training windows by 50% (n_ctx/2).
+    // A stride of n_ctx trains every token exactly once and halves the epoch time (each
+    // token is otherwise the target of two different windows). It is user-selectable so the
+    // existing training semantics stay the default; clamp to n_ctx so no token is skipped.
+    const int64_t stride       = stride_opt > 0
+                               ? std::min<int64_t>(stride_opt, ne_datapoint)
+                               : std::max<int64_t>(1, ne_datapoint / 2);
 
-    auto ndata_of = [&](size_t n_tokens) -> int64_t {
-        if ((int64_t) n_tokens <= ne_datapoint + 1) {
+    auto ndata_of = [&](int64_t n_tokens) -> int64_t {
+        if (n_tokens <= ne_datapoint + 1) {
             return 0;
         }
-        return ((int64_t) n_tokens - ne_datapoint - 1) / stride;
+        return (n_tokens - ne_datapoint - 1) / stride;
     };
 
-    const int64_t ndata_train_all = ndata_of(train.tokens.size());
+    const int64_t ndata_train_all = ndata_of(train.n_tokens);
 
     int64_t ndata_train = 0;
     int64_t ndata_val   = 0;
 
-    const bool have_val_file = val != nullptr && !val->tokens.empty();
+    const bool have_val_file = val != nullptr && val->n_tokens > 0;
 
     if (have_val_file) {
         ndata_train = ndata_train_all;
-        ndata_val   = ndata_of(val->tokens.size());
+        ndata_val   = ndata_of(val->n_tokens);
     } else {
         ndata_val   = (int64_t) (ndata_train_all * val_split);
         ndata_train = ndata_train_all - ndata_val;
@@ -281,14 +454,14 @@ static ggml_opt_dataset_t lumina_dataset_init(
     // datapoint window plus its labels. With n_ctx=32768 and ~166M tokens that is about
     // 2.6 GiB of host memory that is mostly redundant (consecutive windows overlap by
     // half). Instead keep the token stream(s) once and materialise a window on demand.
-    const int32_t * data_val  = have_val_file ? val->tokens.data() : nullptr;
-    const uint8_t * mask_main = train.trainable.empty() ? nullptr : train.trainable.data();
-    const uint8_t * mask_val  = (have_val_file && !val->trainable.empty()) ? val->trainable.data() : nullptr;
+    const int32_t * data_val  = have_val_file ? val->tokens : nullptr;
+    const uint8_t * mask_main = train.mask;
+    const uint8_t * mask_val  = have_val_file ? val->mask : nullptr;
 
     ggml_opt_dataset_t dataset = ggml_opt_dataset_init_compact(
         GGML_TYPE_I32, GGML_TYPE_I32, ne_datapoint, ne_datapoint, ndata, /*ndata_shard =*/ 1,
         stride, ndata_train,
-        train.tokens.data(), mask_main,
+        train.tokens, mask_main,
         data_val, mask_val);
 
     idata_split = ndata_train;
@@ -658,11 +831,24 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // Limit the number of CPU threads used for training (0 = all available cores).
-    if (params.cpu_cores > 0) {
-        params.cpuparams.n_threads       = params.cpu_cores;
-        params.cpuparams_batch.n_threads = params.cpu_cores;
-        LOG_INF("%s: limiting training to %d CPU thread(s)\n", __func__, params.cpu_cores);
+    // Training threads. --cpu-cores N pins the training to N threads; 0 (the default)
+    // uses every hardware thread (logical cores). The generic engine default is the
+    // number of *physical* cores, which leaves the SMT siblings of a 6c/12t CPU idle;
+    // the backward kernels are memory-bandwidth bound, so the extra logical threads
+    // are a real speed-up. This does not change the arithmetic: every kernel still
+    // owns whole output rows, so the per-element accumulation order is identical
+    // (verified bit-exact loss sequence vs. 6 threads).
+    {
+        int n_train_threads = params.cpu_cores > 0
+                            ? params.cpu_cores
+                            : (int) std::thread::hardware_concurrency();
+        if (n_train_threads <= 0) {
+            n_train_threads = 1;
+        }
+        params.cpuparams.n_threads       = n_train_threads;
+        params.cpuparams_batch.n_threads = n_train_threads;
+        LOG_INF("%s: training threads = %d (--cpu-cores %d)\n",
+                __func__, n_train_threads, params.cpu_cores);
     }
 
     // KV cache must be F32 for training (no f16 backward pass for OUT_PROD)
@@ -800,16 +986,47 @@ int main(int argc, char ** argv) {
     drop_trivial_mask(train_stream);
     drop_trivial_mask(val_stream);
 
+    // Move the (potentially hundreds of MiB) token streams out of anonymous memory into
+    // memory-mapped temp files. The trainer reads exactly the same bytes, but the pages are
+    // now clean and file-backed, so the OS can reclaim them under pressure instead of
+    // swapping the process out. When mapping is unavailable we keep the vectors (the view
+    // then points at them) so the run still works.
+    lumina_stream_view train_view;
+    lumina_stream_view val_view;
+
+    const fs::path stream_dir = fs::temp_directory_path() / "lumina-train";
+
+    if (train_view.map_stream(train_stream, stream_dir, "train")) {
+        std::vector<llama_token>().swap(train_stream.tokens);
+        std::vector<uint8_t>().swap(train_stream.trainable);
+        LOG_INF("%s: mapped training token stream to '%s' (%.1f MiB, evictable)\n",
+                __func__, train_view.map_path.string().c_str(), train_view.map_bytes/1048576.0);
+    } else {
+        LOG_WRN("%s: could not map the training token stream; keeping it in RAM\n", __func__);
+    }
+
+    if (has_val_file) {
+        if (val_view.map_stream(val_stream, stream_dir, "val")) {
+            std::vector<llama_token>().swap(val_stream.tokens);
+            std::vector<uint8_t>().swap(val_stream.trainable);
+            LOG_INF("%s: mapped validation token stream to '%s' (%.1f MiB, evictable)\n",
+                    __func__, val_view.map_path.string().c_str(), val_view.map_bytes/1048576.0);
+        } else {
+            LOG_WRN("%s: could not map the validation token stream; keeping it in RAM\n", __func__);
+        }
+    }
+
     ggml_opt_dataset_t dataset = lumina_dataset_init(
-        ctx, train_stream, has_val_file ? &val_stream : nullptr, params.val_split, idata_split);
+        ctx, train_view, has_val_file ? &val_view : nullptr, params.val_split,
+        params.dataset_stride, idata_split);
 
     if (dataset == nullptr) {
         return 1;
     }
 
-    // NOTE: the compact dataset references train_stream/val_stream (tokens + optional
-    // masks) directly, so they must stay alive until the dataset is freed. Do not free
-    // them here (they are released when main() returns, after training).
+    // NOTE: the compact dataset references the views created above (either their mappings
+    // or, as a fallback, the in-memory vectors), so those must stay alive until the dataset
+    // is freed. They are released when main() returns, after training.
 
     struct lr_opt & lr = params.lr;
 
@@ -886,6 +1103,9 @@ int main(int argc, char ** argv) {
     }
 
     uint32_t start_epoch = 0;
+    // position within `start_epoch` at which training resumes (0, 0 = start of epoch)
+    int64_t  resume_idata_start  = 0;
+    int64_t  resume_ubatch_start = 0;
 
     if (adapter != nullptr) {
         g_ckpt.adapter = adapter;
@@ -918,6 +1138,39 @@ int main(int argc, char ** argv) {
                     g_ckpt.cumulative_steps = ckpt_step;
                     start_epoch             = std::min<uint32_t>(ckpt_epoch, lr.epochs);
                     LOG_INF("%s: restored LoRA weights, continuing at epoch %u\n", __func__, start_epoch + 1);
+
+                    // The checkpoint step counts train micro-batches. Convert it back into
+                    // (datapoint, micro-batch-within-datapoint) so the resumed epoch does not
+                    // re-train the data that was already processed. The prefix of the resumed
+                    // datapoint is still run forward (to rebuild its KV cache) but with all
+                    // labels masked, so it contributes no gradient and no weight update.
+                    const int64_t n_ctx_resume    = std::max<int64_t>(1, llama_n_ctx(ctx));
+                    const int64_t n_batch_resume  = std::max<int64_t>(1, std::min<int64_t>(params.n_batch,  n_ctx_resume));
+                    const int64_t n_ubatch_resume = std::max<int64_t>(1, std::min<int64_t>(params.n_ubatch, n_batch_resume));
+                    const int64_t ubatch_per_ctx  = std::max<int64_t>(1, n_ctx_resume / n_ubatch_resume);
+                    const int64_t steps_per_epoch = idata_split * ubatch_per_ctx;
+
+                    if (steps_per_epoch > 0) {
+                        const int64_t epoch_base = (int64_t) start_epoch * steps_per_epoch;
+                        int64_t steps_in_epoch   = ckpt_step - epoch_base;
+                        if (steps_in_epoch < 0 || steps_in_epoch > steps_per_epoch) {
+                            // checkpoint written by a different configuration; restart the epoch
+                            steps_in_epoch = 0;
+                        }
+                        resume_idata_start  = std::min<int64_t>(steps_in_epoch / ubatch_per_ctx, idata_split);
+                        resume_ubatch_start = steps_in_epoch % ubatch_per_ctx;
+                        if (resume_idata_start >= idata_split) {
+                            resume_idata_start  = idata_split;
+                            resume_ubatch_start = 0;
+                        }
+                        // keep the global micro-batch counter aligned with the resumed position
+                        g_ckpt.cumulative_steps = epoch_base + steps_in_epoch;
+
+                        LOG_INF("%s: resuming at datapoint %" PRId64 "/%" PRId64 " of epoch %u, "
+                                "micro-batch %" PRId64 "/%" PRId64 " (global step %" PRId64 ")\n",
+                                __func__, resume_idata_start, idata_split, start_epoch + 1,
+                                resume_ubatch_start, ubatch_per_ctx, g_ckpt.cumulative_steps);
+                    }
                 } else {
                     LOG_ERR("%s: failed to copy checkpoint weights, starting from scratch\n", __func__);
                 }
@@ -943,7 +1196,9 @@ int main(int argc, char ** argv) {
         g_ckpt.epoch = lr.epoch;
         LOG_INF("%s: epoch %u / %u\n", __func__, lr.epoch + 1, lr.epochs);
 
-        llama_opt_epoch(ctx, dataset, result_train, result_eval, idata_split,
+        const int64_t idata_start  = (lr.epoch == start_epoch) ? resume_idata_start  : 0;
+        const int64_t ubatch_start = (lr.epoch == start_epoch) ? resume_ubatch_start : 0;
+        llama_opt_epoch(ctx, dataset, result_train, result_eval, idata_split, idata_start, ubatch_start,
                         adapter != nullptr ? lumina_train_callback : ggml_opt_epoch_callback_progress_bar,
                         ggml_opt_epoch_callback_progress_bar);
         fprintf(stderr, "\n");

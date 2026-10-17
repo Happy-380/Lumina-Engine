@@ -287,6 +287,27 @@ static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & par
     return devices;
 }
 
+#ifndef LUMINA_RPC_BUILD_NUMBER
+#define LUMINA_RPC_BUILD_NUMBER 24
+#endif
+
+// Lumina-Engine: the RPC backend server is a console tool too, but it deliberately does not
+// link llama-common. Keep a small self-contained copy of the shared startup screen here.
+static void rpc_print_lumina_banner(FILE * stream) {
+    fprintf(stream,
+        "\n"
+        "   __                 _\n"
+        "  / / _   _ _ __ ___ (_)_ __   __ _\n"
+        " / / | | | | '_ ` _ \\| | '_ \\ / _` |\n"
+        "/ /__| |_| | | | | | | | | | | (_| |\n"
+        "\\____/\\__,_|_| |_| |_|_|_| |_|\\__,_|  Engine\n");
+    fprintf(stream, "\n");
+    fprintf(stream, "build      : Build %d (Based on llama.cpp b-10991)\n", LUMINA_RPC_BUILD_NUMBER);
+    fprintf(stream, "GitHub     : %s\n", "https://github.com/Happy-380/Lumina-Engine");
+    fprintf(stream, "Donate     : %s  (tip the developer / support development)\n", "https://afdian.com/a/lumi_380");
+    fprintf(stream, "Bilibili   : %s\n", "https://space.bilibili.com/3546376302496335");
+}
+
 int main(int argc, char * argv[]) {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -297,6 +318,8 @@ int main(int argc, char * argv[]) {
         fprintf(stderr, "Invalid parameters\n");
         return 1;
     }
+
+    rpc_print_lumina_banner(stderr);
 
     if (params.host != "127.0.0.1") {
         fprintf(stderr, "\n");

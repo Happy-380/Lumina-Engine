@@ -119,10 +119,10 @@ Clang 会额外构建 `ivybridge/piledriver/cooperlake/zen4/sapphirerapids`，
 MSVC 对分块内核的代码生成略优（+11% vs Clang），Clang 才能构建全部 14 个变体。
 因此交付时把两者合并：
 
-仓库根目录提供了一键脚本，默认组装到 `D:\Lumina-Engine\Lumina-Engine-Bin`：
+仓库根目录提供了一键脚本，默认组装到 `C:\Lumina-Engine\Lumina-Engine-Bin`：
 
 ```bat
-D:\Lumina-Engine\build-bin.bat
+C:\Lumina-Engine\build-bin.bat
 ```
 
 它等价于：
@@ -168,7 +168,7 @@ build-*/bin/
 ```
 
 `Lumina-Engine-Bin/`（即仓库根目录下、与源码目录同级）为最终的 53 文件交付集（含 14 个 CPU 变体 + 运行库），
-也是**唯一的交付目录**；上面的 `build-*/bin/` 只是构建中间产物。旧入口 `D:\Lumina-Engine\llama` 已删除。
+也是**唯一的交付目录**；上面的 `build-*/bin/` 只是构建中间产物。旧入口 `C:\Lumina-Engine\llama` 已删除。
 也可直接调用 `bench\assemble_bin.bat` 只做组装。详见 [Delivery](Delivery.md)。
 
 ---

@@ -116,10 +116,10 @@ Clang additionally builds `ivybridge/piledriver/cooperlake/zen4/sapphirerapids` 
 MSVC generates slightly better code for the tiled kernel (+11% vs Clang), and only Clang can build
 all 14 variants. The delivery therefore merges both:
 
-The repo root provides a one-command script; it assembles into `D:\Lumina-Engine\Lumina-Engine-Bin` by default:
+The repo root provides a one-command script; it assembles into `C:\Lumina-Engine\Lumina-Engine-Bin` by default:
 
 ```bat
-D:\Lumina-Engine\build-bin.bat
+C:\Lumina-Engine\build-bin.bat
 ```
 
 It is equivalent to:
@@ -167,7 +167,7 @@ build-*/bin/
 
 `Lumina-Engine-Bin/` (at the repo root, next to the source directory) is the final 53-file delivery
 set (14 CPU variants + runtime libraries), and it is the **only** delivery directory; the
-`build-*/bin/` outputs above are just build intermediates. The old `D:\Lumina-Engine\llama` entry has been
+`build-*/bin/` outputs above are just build intermediates. The old `C:\Lumina-Engine\llama` entry has been
 removed. You can also call `bench\assemble_bin.bat` directly to assemble only. See [Delivery](Delivery.en.md).
 
 ---

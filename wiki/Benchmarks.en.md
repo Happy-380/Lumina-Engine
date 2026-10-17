@@ -235,7 +235,7 @@ Conclusion: tg and pp (`ne11>=8`) use Q1LUT by default, while pp (`2..7`) uses t
 ## 9. Reproduction commands
 
 ```bat
-cd D:\Lumina-Engine\Lumina-Engine-Bin
+cd C:\Lumina-Engine\Lumina-Engine-Bin
 
 REM Binary LUT A/B (on by default; disable with GGML_Q1_LUT=0)
 set GGML_Q1_LUT=0

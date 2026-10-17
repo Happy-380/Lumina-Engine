@@ -9,6 +9,22 @@ unaffected.
 
 ---
 
+## 0. Unified console startup screen (Build 24)
+
+Every console tool now prints the same Lumina-Engine startup screen (ASCII logo + build number +
+project links):
+
+| File | Type | Description |
+|------|------|-------------|
+| `common/build-info.cpp.in` / `.h` | modified | adds `lumina_ascii_logo()`; `llama_print_lumina_banner()` prints the full startup screen; version bumped to **Build 24** |
+| `common/arg.cpp` | modified | prints the startup screen once `common_params_parse()` succeeds (except `cli`, which draws its own richer banner) |
+| `tools/cli/cli-context.cpp` | modified | drops the local logo copy, reuses `lumina_ascii_logo()` |
+| `tools/server/server.cpp`, `tools/cvector-generator/cvector-generator.cpp` | modified | removed duplicate banner printing |
+| `tools/gguf-split/gguf-split.cpp` | modified | prints the startup screen; `--version` reuses `llama_print_build_info()` |
+| `tools/rpc/rpc-server.cpp` / `tools/rpc/CMakeLists.txt` | modified | does not link `llama-common`; prints the same screen from `LUMINA_RPC_BUILD_NUMBER` + the same ASCII art |
+
+---
+
 ## 1. `ggml/src/ggml-cpu/q1t.cpp` (new, ~480 lines)
 
 The dedicated Q1_0 inference kernel. Key contents:
@@ -314,7 +330,7 @@ inference code involved; see [Delivery](Delivery.en.md)):
 | `bench/build_haswell.bat` / `bench/build_x64.bat` | single-variant incremental builds (dev) |
 | `bench/bench_lut2.cpp` | standalone Q1LUT kernel micro-benchmark (with correctness checks) |
 
-**Convention**: `Lumina-Engine-Bin` is the only delivery directory; the old `D:\Lumina-Engine\llama` entry has
+**Convention**: `Lumina-Engine-Bin` is the only delivery directory; the old `C:\Lumina-Engine\llama` entry has
 been removed.
 
 ---

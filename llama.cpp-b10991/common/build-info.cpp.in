@@ -26,7 +26,10 @@ const char * llama_build_target(void) {
 
 const char * llama_build_info(void) {
     // Lumina-Engine build identity (kept independent of the upstream git commit count).
-    return "Build 19 (Based on llama.cpp b-10991)";
+    // Derived from LLAMA_BUILD_NUMBER so the banner can never drift from --version.
+    static const std::string s =
+        "Build " + std::to_string(LLAMA_BUILD_NUMBER) + " (Based on llama.cpp b-10991)";
+    return s.c_str();
 }
 
 const char * lumina_project_github(void) {
@@ -41,11 +44,23 @@ const char * lumina_developer_bilibili(void) {
     return "https://space.bilibili.com/3546376302496335";
 }
 
+const char * lumina_ascii_logo(void) {
+    return
+        "\n"
+        "   __                 _\n"
+        "  / / _   _ _ __ ___ (_)_ __   __ _\n"
+        " / / | | | | '_ ` _ \\| | '_ \\ / _` |\n"
+        "/ /__| |_| | | | | | | | | | | (_| |\n"
+        "\\____/\\__,_|_| |_| |_|_|_| |_|\\__,_|  Engine\n";
+}
+
 void llama_print_lumina_banner(FILE * stream) {
-    fprintf(stream, "%s\n", llama_build_info());
-    fprintf(stream, "  GitHub   : %s\n", lumina_project_github());
-    fprintf(stream, "  Donate   : %s  (tip the developer / support development)\n", lumina_project_donate());
-    fprintf(stream, "  Bilibili : %s\n", lumina_developer_bilibili());
+    fprintf(stream, "%s", lumina_ascii_logo());
+    fprintf(stream, "\n");
+    fprintf(stream, "build      : %s\n", llama_build_info());
+    fprintf(stream, "GitHub     : %s\n", lumina_project_github());
+    fprintf(stream, "Donate     : %s  (tip the developer / support development)\n", lumina_project_donate());
+    fprintf(stream, "Bilibili   : %s\n", lumina_developer_bilibili());
 }
 
 void llama_print_build_info(const char * llama_version, FILE * stream) {

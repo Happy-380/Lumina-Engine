@@ -1669,12 +1669,18 @@ extern "C" {
 
     LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
 
+    // Resume support: the training pass starts at datapoint `idata_start` (in [0, idata_split))
+    // and, within that first datapoint, at micro-batch `ubatch_start`. The skipped micro-batches
+    // are still run forward to rebuild the KV cache, but with all labels masked so they do not
+    // contribute any gradient or update any weight. Pass (0, 0) for a normal epoch.
     LLAMA_API void llama_opt_epoch(
             struct llama_context    * lctx,
             ggml_opt_dataset_t        dataset,
             ggml_opt_result_t         result_train,
             ggml_opt_result_t         result_eval,
             int64_t                   idata_split,
+            int64_t                   idata_start,
+            int64_t                   ubatch_start,
             ggml_opt_epoch_callback   callback_train,
             ggml_opt_epoch_callback   callback_eval);
 

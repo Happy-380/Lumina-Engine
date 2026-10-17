@@ -3413,6 +3413,14 @@ static void llama_set_param(struct ggml_tensor * tensor, llama_opt_param_filter 
 
 void llama_context::opt_init(struct llama_model * model, struct llama_opt_params lopt_params) {
     GGML_ASSERT(!opt_ctx);
+
+    // mark the context as a training context: the attention builder uses this to request
+    // gradient recomputation of the attention scores (see build_attn_mha and
+    // ggml_compute_backward). Without it the backward keeps the full
+    // [n_ctx, n_ubatch, n_head] softmax activations of every layer alive, which is what
+    // makes long-context training spill into swap on memory-constrained machines.
+    cparams.training = true;
+
     model->hparams.n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
     const uint32_t n_batch     = std::min(this->n_batch(),  model->hparams.n_ctx_train);
     const uint32_t n_ubatch    = std::min(this->n_ubatch(), n_batch);
@@ -3440,7 +3448,27 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     opt_params.get_opt_pars    = lopt_params.get_opt_pars;
     opt_params.get_opt_pars_ud = lopt_params.get_opt_pars_ud;
     opt_params.optimizer       = lopt_params.optimizer_type;
+    // Training never reads the per-datapoint predictions back; keeping them would make the
+    // result grow by one int32 per evaluated token (several GiB for a corpus like stage1)
+    // and push memory-constrained machines into swap. Loss/accuracy are unaffected.
+    opt_params.collect_pred    = false;
     opt_ctx = ggml_opt_init(opt_params);
+
+    {
+        // report the training memory footprint (model / KV+context / compute buffers).
+        // uses stderr directly: the llama-core INFO logger is below the training tool's
+        // verbosity threshold, so LLAMA_LOG_INFO would be swallowed.
+        const auto mb = memory_breakdown();
+        size_t model = 0, context = 0, compute = 0;
+        for (const auto & entry : mb) {
+            model   += entry.second.model;
+            context += entry.second.context;
+            compute += entry.second.compute;
+        }
+        fprintf(stderr, "%s: training memory: model = %.2f MiB (file-backed, reclaimable), "
+                "KV cache = %.2f MiB, compute buffers = %.2f MiB\n",
+                __func__, model/1048576.0, context/1048576.0, compute/1048576.0);
+    }
 
     llama_opt_param_filter param_filter = lopt_params.param_filter;
     void * param_filter_ud              = lopt_params.param_filter_ud;
@@ -3488,7 +3516,8 @@ void llama_context::opt_epoch_iter(
         bool                             train,
         int64_t                          idata_in_loop,
         int64_t                          ndata_in_loop,
-        int64_t                          t_loop_start) {
+        int64_t                          t_loop_start,
+        int64_t                          ubatch_skip) {
     GGML_ASSERT(opt_ctx);
     const uint32_t n_ctx    = llama_model_n_ctx_train(&model);
     const uint32_t n_batch  = std::min(this->n_batch(),  n_ctx);
@@ -3563,28 +3592,46 @@ void llama_context::opt_epoch_iter(
                 ctx_compute_opt = ggml_init(params);
             }
             ggml_opt_prepare_alloc(opt_ctx, ctx_compute_opt, gf, res->get_inp_tokens(), res->get_logits());
-            ggml_opt_alloc(opt_ctx, train);
+
+            // already-trained prefix of a resumed datapoint: rebuild the KV cache with a
+            // forward-only evaluation (no backward, no optimizer step), so training resumes
+            // without re-applying updates to the data that was already processed
+            const int64_t micro_idx = (int64_t) ((pos_ctx + pos_batch)/n_ubatch);
+            const bool    skip      = micro_idx < ubatch_skip;
+
+            if (skip && (micro_idx % 16) == 0) {
+                fprintf(stderr, "%s: resuming: rebuilding KV cache (forward-only), micro-batch %" PRId64 "/%" PRId64 "\r",
+                        __func__, micro_idx, ubatch_skip);
+                fflush(stderr);
+            }
+
+            ggml_opt_alloc(opt_ctx, skip ? false : train);
 
             res->set_inputs(&ubatch);
             {
                 struct ggml_tensor * labels = ggml_opt_labels(opt_ctx);
                 GGML_ASSERT(labels->ne[1] == n_ubatch);
                 ggml_set_zero(labels);
-                const float onef = 1.0f;
-                for (uint32_t pos_ubatch = 0; pos_ubatch < n_ubatch; ++pos_ubatch) {
-                    const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
-                    GGML_ASSERT(labels_sparse[ilabel] < labels->ne[0]);
-                    // a negative label marks a masked position (e.g. chat history that must not
-                    // contribute to the loss): the one-hot row stays zero, so the loss and the
-                    // gradient for that position are exactly zero
-                    if (labels_sparse[ilabel] >= 0) {
-                        ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
+                if (!skip) {
+                    const float onef = 1.0f;
+                    for (uint32_t pos_ubatch = 0; pos_ubatch < n_ubatch; ++pos_ubatch) {
+                        const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
+                        GGML_ASSERT(labels_sparse[ilabel] < labels->ne[0]);
+                        // a negative label marks a masked position (e.g. chat history that must not
+                        // contribute to the loss): the one-hot row stays zero, so the loss and the
+                        // gradient for that position are exactly zero
+                        if (labels_sparse[ilabel] >= 0) {
+                            ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
+                        }
                     }
                 }
             }
-            ggml_opt_eval(opt_ctx, result);
-            if (callback) {
-                callback(train, opt_ctx, dataset, result, idata_in_loop + (pos_ctx + pos_batch)/n_ubatch + 1, ndata_in_loop, t_loop_start);
+            ggml_opt_eval(opt_ctx, skip ? nullptr : result);
+            if (skip) {
+                // the forward-only pass must not advance the gradient-accumulation phase
+                ggml_opt_reset_opt_i(opt_ctx);
+            } else if (callback) {
+                callback(train, opt_ctx, dataset, result, idata_in_loop + micro_idx + 1, ndata_in_loop, t_loop_start);
             }
             ggml_free(ctx_compute_opt);
 
@@ -3598,6 +3645,8 @@ void llama_context::opt_epoch(
         ggml_opt_result_t         result_train,
         ggml_opt_result_t         result_eval,
         int64_t                   idata_split,
+        int64_t                   idata_start,
+        int64_t                   ubatch_start,
         ggml_opt_epoch_callback   callback_train,
         ggml_opt_epoch_callback   callback_eval) {
     const uint32_t n_ctx    = this->n_ctx();
@@ -3607,6 +3656,9 @@ void llama_context::opt_epoch(
 
     GGML_ASSERT(idata_split >= 0);
     GGML_ASSERT(idata_split <= ndata);
+    GGML_ASSERT(idata_start >= 0);
+    GGML_ASSERT(idata_start <= idata_split);
+    GGML_ASSERT(ubatch_start >= 0);
 
     const uint32_t ubatch_per_ctx = n_ctx / n_ubatch;
 
@@ -3614,17 +3666,19 @@ void llama_context::opt_epoch(
     std::vector<llama_token>        tokens(n_ctx);
     std::vector<llama_token> labels_sparse(n_ctx);
 
-    int64_t idata = 0;
+    // resume an interrupted epoch: skip the datapoints that were already trained
+    int64_t idata = idata_start;
 
     int64_t t_loop_start = ggml_time_us();
     int64_t ndata_in_loop = idata_split*ubatch_per_ctx;
     for (; idata < idata_split; ++idata) {
         constexpr bool train = true;
         const int64_t idata_in_loop = idata*ubatch_per_ctx;
+        const int64_t ubatch_skip   = (idata == idata_start) ? ubatch_start : 0;
 
         ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
         opt_epoch_iter(dataset, result_train, tokens, labels_sparse, batch,
-            callback_train, train, idata_in_loop, ndata_in_loop, t_loop_start);
+            callback_train, train, idata_in_loop, ndata_in_loop, t_loop_start, ubatch_skip);
     }
 
     t_loop_start = ggml_time_us();
@@ -3635,7 +3689,7 @@ void llama_context::opt_epoch(
 
         ggml_opt_dataset_get_batch_host(dataset, tokens.data(), n_ctx*sizeof(llama_token), labels_sparse.data(), idata);
         opt_epoch_iter(dataset, result_eval, tokens, labels_sparse, batch,
-            callback_eval, train, idata_in_loop, ndata_in_loop, t_loop_start);
+            callback_eval, train, idata_in_loop, ndata_in_loop, t_loop_start, /*ubatch_skip =*/ 0);
     }
 
     llama_batch_free(batch);
@@ -4341,6 +4395,8 @@ void llama_opt_epoch(
         ggml_opt_result_t         result_train,
         ggml_opt_result_t         result_eval,
         int64_t                   idata_split,
+        int64_t                   idata_start,
+        int64_t                   ubatch_start,
         ggml_opt_epoch_callback   callback_train,
         ggml_opt_epoch_callback   callback_eval) {
     ctx->opt_epoch(
@@ -4348,6 +4404,8 @@ void llama_opt_epoch(
         result_train,
         result_eval,
         idata_split,
+        idata_start,
+        ubatch_start,
         callback_train,
         callback_eval);
 }

@@ -5,6 +5,12 @@
 This wiki documents the repository's **CPU inference optimizations for Bonsai 1-bit (Q1_0)
 models**: principles, implementation, build, delivery, testing and troubleshooting.
 
+> **Current build: Build 24 (Based on llama.cpp b-10991).** Every console tool (`cli` /
+> `server` / `train` / `bench` / `perplexity` / `quantize` / `imatrix` / `tokenize` /
+> `gguf-split` / `rpc-server`) prints the same Lumina-Engine startup screen at launch
+> (ASCII logo + build number + GitHub / Afdian / Bilibili links). The build number comes from
+> `LLAMA_BUILD_NUMBER` and always matches `--version`.
+
 ## Pages
 
 | Page | Content |
@@ -63,7 +69,7 @@ Every weight in Bonsai-8B is 1-bit (`GGML_TYPE_Q1_0`: 128 weights share one fp16
 ### Quick commands
 ```bat
 REM Delivery artifacts live in Lumina-Engine-Bin\ at the repo root (the only delivery dir; see Delivery.en.md)
-cd D:\Lumina-Engine\Lumina-Engine-Bin
+cd C:\Lumina-Engine\Lumina-Engine-Bin
 Lumina-Engine-bench.exe -m ..\Bonsai-8B.gguf -p 512 -n 128 -t 6
 
 set GGML_NO_Q1_TILE=1   & REM fall back to the generic kernel for A/B (pp+tg)

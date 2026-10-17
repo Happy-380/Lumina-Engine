@@ -1,7 +1,7 @@
 @echo off
 REM ---------------------------------------------------------------------------
 REM Build both trees (MSVC + clang) and assemble the runtime into the default
-REM delivery directory D:\Lumina-Engine\Lumina-Engine-Bin via bench\assemble_bin.bat.
+REM delivery directory C:\Lumina-Engine\Lumina-Engine-Bin via bench\assemble_bin.bat.
 REM ---------------------------------------------------------------------------
 call "%~dp0bench\build_all_msvc.bat"
 if errorlevel 1 ( echo [build-bin] MSVC build failed & exit /b 1 )

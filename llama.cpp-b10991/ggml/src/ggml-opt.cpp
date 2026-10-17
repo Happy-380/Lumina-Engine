@@ -79,6 +79,9 @@ struct ggml_opt_context {
     struct ggml_tensor *          opt_step_params = nullptr; // Stores output of get_opt_pars.
 
     enum ggml_opt_optimizer_type optimizer = GGML_OPT_OPTIMIZER_TYPE_ADAMW;
+
+    // if false, ggml_opt_eval does not append predictions to the result (see ggml_opt_params)
+    bool collect_pred = true;
 };
 
 struct ggml_opt_result {
@@ -397,6 +400,7 @@ struct ggml_opt_params ggml_opt_default_params(
         /*get_opt_pars    =*/ ggml_opt_get_default_optimizer_params,
         /*get_opt_pars_ud =*/ nullptr,
         /*optimizer       =*/ GGML_OPT_OPTIMIZER_TYPE_ADAMW,
+        /*collect_pred    =*/ true,
     };
 }
 
@@ -678,6 +682,7 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
         }
     }
 
+
     if (!opt_ctx->buf_static) {
         opt_ctx->buf_static = ggml_backend_alloc_ctx_tensors(
             opt_ctx->ctx_static, ggml_backend_sched_get_backend(opt_ctx->backend_sched, 0));
@@ -700,6 +705,7 @@ ggml_opt_context_t ggml_opt_init(struct ggml_opt_params params) {
     result->get_opt_pars     = params.get_opt_pars;
     result->get_opt_pars_ud  = params.get_opt_pars_ud;
     result->optimizer        = params.optimizer;
+    result->collect_pred     = params.collect_pred;
 
     GGML_ASSERT(result->opt_period >= 1);
 
@@ -741,6 +747,10 @@ void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer) {
     } else {
         ggml_graph_reset(opt_ctx->gb_grad);
     }
+}
+
+void ggml_opt_reset_opt_i(ggml_opt_context_t opt_ctx) {
+    opt_ctx->opt_i = 0;
 }
 
 bool ggml_opt_static_graphs(ggml_opt_context_t opt_ctx) {
@@ -998,7 +1008,8 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     ggml_backend_tensor_get(opt_ctx->loss, &loss, 0, ggml_nbytes(opt_ctx->loss));
     result->loss.push_back(loss);
 
-    if (opt_ctx->pred) {
+    // only materialise the (potentially huge) prediction vector when the caller asked for it
+    if (opt_ctx->collect_pred && opt_ctx->pred) {
         GGML_ASSERT(opt_ctx->pred->type == GGML_TYPE_I32);
         std::vector<int32_t> pred(ndata);
         ggml_backend_tensor_get(opt_ctx->pred, pred.data(), 0, ggml_nbytes(opt_ctx->pred));
@@ -1111,14 +1122,70 @@ void ggml_opt_epoch_callback_progress_bar(
     double accuracy_unc;
     ggml_opt_result_accuracy(result, &accuracy, &accuracy_unc);
 
-    const int64_t t_ibatch_us = ggml_time_us() - t_start_us;
+    const int64_t t_now_us    = ggml_time_us();
+    const int64_t t_ibatch_us = t_now_us - t_start_us;
     int64_t t_ibatch_s = t_ibatch_us / 1000000;
     const int64_t t_ibatch_h = t_ibatch_s / 3600;
     t_ibatch_s -= t_ibatch_h * 3600;
     const int64_t t_ibatch_m = t_ibatch_s / 60;
     t_ibatch_s -= t_ibatch_m * 60;
 
-    const int64_t t_eta_us = t_ibatch_us * (ibatch_max - ibatch)/ibatch;
+    // ETA from a sliding window of recent micro-batches instead of the running mean.
+    //
+    // The per-micro-batch cost is not constant: inside one datapoint the attention grows
+    // with the context position (O(context)), so a fresh 32k-token window starts out cheap
+    // and ends several times more expensive. The running mean only approaches the real cost
+    // after a full window has been processed, and --resume makes that far worse: the epoch
+    // loop restarts its clock while the "processed batches" counter is restored from the
+    // checkpoint, so the mean starts far too low and keeps climbing for hours ("ETA keeps
+    // growing / training looks slower and slower"). A window of one whole datapoint is
+    // representative of the steady-state cost, so the ETA is stable after the first window.
+    //
+    // Note: ggml_opt_inputs() is a 1-D token-id tensor, so its ne[1] is always 1; the
+    // micro-batch size is the second dimension of the labels tensor [n_vocab, n_ubatch].
+    const int64_t n_ctx_data = ggml_opt_dataset_data(dataset)->ne[0];
+    const int64_t n_ubatch   = ggml_opt_labels(opt_ctx) != nullptr ? ggml_opt_labels(opt_ctx)->ne[1] : 1;
+    const int64_t ubatch_per_ctx = std::max<int64_t>(1, n_ctx_data / std::max<int64_t>(1, n_ubatch));
+    const int64_t eta_window     = std::min<int64_t>(4096, std::max<int64_t>(16, ubatch_per_ctx));
+
+    static std::vector<int64_t> s_eta_dur;
+    static int64_t              s_eta_head        = 0;
+    static int64_t              s_eta_filled      = 0;
+    static int64_t              s_eta_sum         = 0;
+    static int64_t              s_eta_last_ibatch = 0;
+    static int64_t              s_eta_last_us     = 0;
+    static bool                 s_eta_last_train  = false;
+
+    if (train != s_eta_last_train || ibatch <= s_eta_last_ibatch ||
+        (int64_t) s_eta_dur.size() != eta_window) {
+        s_eta_dur.assign(eta_window, 0);
+        s_eta_head        = 0;
+        s_eta_filled      = 0;
+        s_eta_sum         = 0;
+        s_eta_last_us     = 0;
+    }
+
+    if (s_eta_last_us != 0 && ibatch == s_eta_last_ibatch + 1) {
+        const int64_t dt = t_now_us - s_eta_last_us;
+        if (s_eta_filled == eta_window) {
+            s_eta_sum -= s_eta_dur[s_eta_head];
+        } else {
+            ++s_eta_filled;
+        }
+        s_eta_dur[s_eta_head] = dt;
+        s_eta_sum += dt;
+        s_eta_head = (s_eta_head + 1) % eta_window;
+    }
+    s_eta_last_ibatch = ibatch;
+    s_eta_last_us     = t_now_us;
+    s_eta_last_train  = train;
+
+    int64_t t_eta_us;
+    if (s_eta_filled > 0) {
+        t_eta_us = (s_eta_sum / s_eta_filled) * (ibatch_max - ibatch);
+    } else {
+        t_eta_us = ibatch > 0 ? t_ibatch_us * (ibatch_max - ibatch) / ibatch : 0;
+    }
     int64_t t_eta_s = t_eta_us / 1000000;
     const int64_t t_eta_h = t_eta_s / 3600;
     t_eta_s -= t_eta_h * 3600;
@@ -1133,8 +1200,6 @@ void ggml_opt_epoch_callback_progress_bar(
         fprintf(stderr, "\n");
     }
     fflush(stderr);
-
-    GGML_UNUSED(dataset);
 }
 
 void ggml_opt_fit(

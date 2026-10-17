@@ -1,6 +1,6 @@
 @echo off
-call "D:\VS2022\VC\Auxiliary\Build\vcvars64.bat" >nul
-set PATH=C:\Program Files\CMake\bin;D:\VS2022\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;%PATH%
+call "D:\VS2026\VC\Auxiliary\Build\vcvars64.bat" >nul
+set PATH=C:\Program Files\CMake\bin;D:\VS2026\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja;%PATH%
 REM Vulkan backend: the LunarG SDK was unpacked to D:\VulkanSDK\sdk (no admin install).
 if exist "D:\VulkanSDK\sdk\Bin\glslc.exe" (
   set "VULKAN_SDK=D:\VulkanSDK\sdk"
@@ -10,7 +10,7 @@ if exist "D:\VulkanSDK\sdk\Bin\glslc.exe" (
   echo [configure-release] warning: Vulkan SDK not found, building without Vulkan
   set "GGML_VULKAN_OPT=-DGGML_VULKAN=OFF"
 )
-cd /d D:\Lumina-Engine\llama.cpp-b10991
+cd /d C:\Lumina-Engine\llama.cpp-b10991
 cmake -S . -B build-release -G Ninja ^
   -DCMAKE_BUILD_TYPE=Release ^
   -DBUILD_SHARED_LIBS=ON ^

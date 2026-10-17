@@ -231,7 +231,7 @@ K 分块对照（`GGML_Q1_LUT_KB`，`-p 64 -n 128 -t 6`）：
 ## 9. 复现命令
 
 ```bat
-cd D:\Lumina-Engine\Lumina-Engine-Bin
+cd C:\Lumina-Engine\Lumina-Engine-Bin
 
 REM 二值查表 A/B（默认开启；关闭用 GGML_Q1_LUT=0）
 set GGML_Q1_LUT=0

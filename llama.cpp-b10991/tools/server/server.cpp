@@ -109,8 +109,6 @@ int llama_server(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
-    llama_print_lumina_banner(stderr);
-
     return llama_server(params, argc, argv);
 }
 

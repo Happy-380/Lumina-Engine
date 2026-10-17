@@ -12,10 +12,10 @@
 最终交付目录固定为：
 
 ```
-D:\Lumina-Engine\Lumina-Engine-Bin          （等价写法： 仓库根目录\Lumina-Engine-Bin）
+C:\Lumina-Engine\Lumina-Engine-Bin          （等价写法： 仓库根目录\Lumina-Engine-Bin）
 ```
 
-- 与源码目录 `llama.cpp-b10991\` 同级，位于仓库根 `D:\Lumina-Engine\` 下。
+- 与源码目录 `llama.cpp-b10991\` 同级，位于仓库根 `C:\Lumina-Engine\` 下。
 - 共 **55 个文件**：14 个 CPU 后端 DLL + `ggml-vulkan.dll` + 全部工具 + 运行库。
 - 组装方式：有 clang 构建时以 clang 产物为基底（14 变体），再用 9 个 MSVC 变体覆盖；
   无 clang 时（本机现状）以 MSVC `build-release` 为基底，并从 `bench\clang_variants_backup\`
@@ -24,7 +24,7 @@ D:\Lumina-Engine\Lumina-Engine-Bin          （等价写法： 仓库根目录\L
 - 这是**唯一**的交付目录。`llama.cpp-b10991\build-release` / `build-clang` 只是**构建中间产物**，不是交付物。
 
 ```bat
-cd D:\Lumina-Engine\Lumina-Engine-Bin
+cd C:\Lumina-Engine\Lumina-Engine-Bin
 Lumina-Engine-bench.exe -m ..\Bonsai-8B.gguf -p 512 -n 128 -t 6
 Lumina-Engine-cli.exe   -m ..\Bonsai-8B.gguf -p "The capital of France is" -n 8 -t 6
 ```
@@ -36,7 +36,7 @@ Lumina-Engine-cli.exe   -m ..\Bonsai-8B.gguf -p "The capital of France is" -n 8 
 仓库根目录提供一键脚本：
 
 ```bat
-D:\Lumina-Engine\build-bin.bat
+C:\Lumina-Engine\build-bin.bat
 ```
 
 它依次执行三步，任一步失败即中止：
@@ -45,7 +45,7 @@ D:\Lumina-Engine\build-bin.bat
 |:--:|------|------|
 | 1 | `bench\build_all_msvc.bat` | 编译 `llama.cpp-b10991\build-release`（**9 个 MSVC 变体** + 工具） |
 | 2 | `bench\build_all_clang.bat` | 编译 `llama.cpp-b10991\build-clang`（**14 个变体** + 工具 + libomp） |
-| 3 | `bench\assemble_bin.bat` | 组装到 `D:\Lumina-Engine\Lumina-Engine-Bin` |
+| 3 | `bench\assemble_bin.bat` | 组装到 `C:\Lumina-Engine\Lumina-Engine-Bin` |
 
 > 只改了某一份源码、想重新组装时，可**单独**运行 `bench\assemble_bin.bat`（它会先删除并重建交付目录）。
 
@@ -56,7 +56,7 @@ D:\Lumina-Engine\build-bin.bat
 脚本内的关键变量与行为：
 
 ```bat
-set "ROOT=%~dp0.."                                  REM 仓库根 = D:\Lumina-Engine
+set "ROOT=%~dp0.."                                  REM 仓库根 = C:\Lumina-Engine
 set "SRC_CLANG=%ROOT%\llama.cpp-b10991\build-clang\bin"
 set "SRC_MSVC =%ROOT%\llama.cpp-b10991\build-release\bin"
 set "DST=%ROOT%\Lumina-Engine-Bin"                  REM 交付目录
@@ -134,7 +134,7 @@ cmake --build build-clang -j 12
 ## 5. 目录与脚本一览
 
 ```
-D:\Lumina-Engine\
+C:\Lumina-Engine\
 ├─ build-bin.bat                     # ★ 一键：MSVC + Clang 编译 + 组装到 Lumina-Engine-Bin
 ├─ configure-release.bat             # 配置 MSVC 构建树 build-release（9 变体）
 ├─ build-release.bat                 # 增量编译 build-release
@@ -157,7 +157,7 @@ D:\Lumina-Engine\
 ## 6. 约定（重要）
 
 1. **以后所有编译产物只放 `.\Lumina-Engine-Bin`。** 不要新增第二份交付目录。
-2. 旧的 `D:\Lumina-Engine\llama` 入口**已删除**，其内容由 `Lumina-Engine-Bin` 取代。
+2. 旧的 `C:\Lumina-Engine\llama` 入口**已删除**，其内容由 `Lumina-Engine-Bin` 取代。
 3. `build-release` / `build-clang` 是**构建中间产物**，供 `assemble_bin.bat` 取件；不是交付物。
 4. 旧的单变体 `build\` 目录已清理，仅保留 `configure.bat` + `build.bat` 供本机快速开发重建，
    **不参与交付**。
@@ -168,13 +168,15 @@ D:\Lumina-Engine\
 ## 7. 生成后验证
 
 ```bat
-cd D:\Lumina-Engine\Lumina-Engine-Bin
+cd C:\Lumina-Engine\Lumina-Engine-Bin
 
-REM 1) 版本横幅：应显示 Build 8 (Based on llama.cpp b-10991)
+REM 1) 版本横幅：应显示 Build 24 (Based on llama.cpp b-10991)
 Lumina-Engine-cli.exe --version
+Lumina-Engine-server.exe --help
+Lumina-Engine-train.exe --version
 Lumina-Engine-cli.exe -m ..\Bonsai-8B.gguf -p "The capital of France is" -n 8 -t 6 --temp 0
 
-REM 2) 确认交付文件数（应为 55）
+REM 2) 确认交付文件数（应为 54）
 dir /b | find /c /v ""
 
 REM 3) 确认 Q1LUT 已启用（AVX2 机器）
@@ -186,9 +188,10 @@ set GGML_Q1_LUT_DEBUG=
 
 预期：
 
-- 横幅显示 `Build 8 (Based on llama.cpp b-10991)`；
+- 横幅显示 `Build 24 (Based on llama.cpp b-10991)`；`cli` / `server` / `train` 等所有控制台
+  启动时均打印同一套 ASCII logo + Build 号 + 项目链接；
 - `-p "The capital of France is"` 输出 `Paris.`；
-- 交付目录 55 个文件；
+- 交付目录 54 个文件；
 - AVX2 机器上默认启用 Q1LUT（`q1lut alloc` 日志 / 关闭用 `GGML_Q1_LUT=0`）。
 
 ---

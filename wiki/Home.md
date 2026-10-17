@@ -5,6 +5,12 @@
 本 wiki 详细介绍本仓库对 **Bonsai 1-bit（Q1_0）模型在 CPU 上的推理优化**：
 原理、实现、编译、交付、测试与排障。
 
+> **当前构建：Build 24（Based on llama.cpp b-10991）。** 所有控制台工具（`cli` /
+> `server` / `train` / `bench` / `perplexity` / `quantize` / `imatrix` / `tokenize` /
+> `gguf-split` / `rpc-server`）启动时都会打印统一的 Lumina-Engine 启动画面
+> （ASCII logo + Build 号 + GitHub / 爱发电 / Bilibili 链接），Build 号由
+> `LLAMA_BUILD_NUMBER` 自动生成，与 `--version` 一致。
+
 ## 页面
 
 | 页面 | 内容 |
@@ -54,7 +60,7 @@ CPU 上：
 ### 快速命令
 ```bat
 REM 交付产物在仓库根目录的 Lumina-Engine-Bin\（唯一的交付目录，见 Delivery.md）
-cd D:\Lumina-Engine\Lumina-Engine-Bin
+cd C:\Lumina-Engine\Lumina-Engine-Bin
 Lumina-Engine-bench.exe -m ..\Bonsai-8B.gguf -p 512 -n 128 -t 6
 
 set GGML_NO_Q1_TILE=1   & REM 回退到通用内核做 A/B (pp+tg)

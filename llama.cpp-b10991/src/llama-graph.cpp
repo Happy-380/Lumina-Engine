@@ -2704,6 +2704,21 @@ ggml_tensor * llm_graph_context::build_attn_mha(
         ggml_tensor * kqv = ggml_mul_mat(ctx0, v, kq);
         cb(kqv, "kqv", il);
 
+        // Memory-efficient training. Tag the attention output matmul with the (permuted)
+        // query/key and the attention mask so that ggml_build_backward_expand can recompute
+        // the attention scores + softmax on the fly during the backward pass instead of
+        // retaining them for every layer. The stored forward activations are then freed and
+        // their buffers reused across layers, which turns the O(n_layer * n_ctx * n_ubatch)
+        // activation memory into O(n_ctx * n_ubatch) -- the difference between fitting in
+        // RAM and being pushed into swap for long-context training. Numerically identical:
+        // the same ops run on the same inputs.
+        if (cparams.training && kq_b == nullptr && !hparams.attn_soft_cap &&
+            arch != LLM_ARCH_GROK && sinks == nullptr) {
+            kqv->src[2] = k;       // key  (permuted)
+            kqv->src[3] = q;       // query (permuted)
+            kqv->src[4] = kq_mask; // attention mask
+        }
+
         // for MLA with the absorption optimization, we need to "decompress" from MQA back to MHA
         if (v_mla) {
             kqv = ggml_mul_mat(ctx0, v_mla, kqv);

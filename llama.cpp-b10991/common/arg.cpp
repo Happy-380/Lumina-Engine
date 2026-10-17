@@ -1313,6 +1313,13 @@ bool common_params_parse(int argc, char ** argv, common_params & params, llama_e
         exit(1); // for other exceptions, we exit with status code 1
     }
 
+    // Lumina-Engine: every console tool shows the same startup screen. The CLI draws its
+    // own richer banner (model + available commands) in cli-context.cpp, so skip it here to
+    // avoid printing the logo twice.
+    if (ex != LLAMA_EXAMPLE_CLI) {
+        llama_print_lumina_banner();
+    }
+
     return true;
 }
 
@@ -4552,6 +4559,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) { params.dataset_limit = value; }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
     add_opt(common_arg(
+        {"--dataset-stride"}, "N",
+        "stride between consecutive training windows in tokens (0 = n_ctx/2, i.e. 50% overlap, default). "
+        "Setting it to n_ctx trains each token once instead of twice and roughly halves the epoch time; "
+        "values larger than n_ctx are clamped to n_ctx so no tokens are skipped",
+        [](common_params & params, int value) { params.dataset_stride = value; }
+    ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
+    add_opt(common_arg(
         {"--dataset-chat-template"}, "TEMPLATE",
         "chat template override used to format 'messages'/'conversations' records (default: the model's own template)",
         [](common_params & params, const std::string & value) { params.dataset_chat_template = value; }
@@ -4573,7 +4587,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
     add_opt(common_arg(
         {"--save-every-steps", "--save-steps"}, "N",
-        string_format("save a training checkpoint every N optimizer steps (0 = disabled, default: %d)", params.save_every_steps),
+        string_format("save a training checkpoint every N training micro-batches (ubatch steps; one optimizer step spans n_batch/n_ubatch micro-batches; 0 = disabled, default: %d)", params.save_every_steps),
         [](common_params & params, int value) { params.save_every_steps = value; }
     ).set_examples({ LLAMA_EXAMPLE_FINETUNE }));
     add_opt(common_arg(

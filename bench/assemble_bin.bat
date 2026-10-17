@@ -1,7 +1,7 @@
 @echo off
 REM ---------------------------------------------------------------------------
 REM Assemble the Lumina-Engine runtime into the default delivery directory:
-REM     <repo root>\Lumina-Engine-Bin      (i.e. D:\Lumina-Engine\Lumina-Engine-Bin)
+REM     <repo root>\Lumina-Engine-Bin      (i.e. C:\Lumina-Engine\Lumina-Engine-Bin)
 REM
 REM Layout: when a clang build is available it is used as the base (tools + all
 REM 14 ggml-cpu variants) and the 9 MSVC variants overwrite their clang

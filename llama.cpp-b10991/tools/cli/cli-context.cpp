@@ -40,14 +40,6 @@ static bool should_stop() {
 
 static constexpr size_t FILE_GLOB_MAX_RESULTS = 100;
 
-const char * LLAMA_ASCII_LOGO = R"(
-   __                 _                 
-  / / _   _ _ __ ___ (_)_ __   __ _      
- / / | | | | '_ ` _ \| | '_ \ / _` |
-/ /__| |_| | | | | | | | | | | (_| |
-\____/\__,_|_| |_| |_|_|_| |_|\__,_|  Engine
-)";
-
 // number of values an arg consumes on the command line
 static int arg_num_values(const common_arg & opt) {
     if (opt.value_hint_2 != nullptr) {
@@ -424,8 +416,7 @@ int cli_context::run() {
     }
 
     std::string banner;
-    banner += "\n";
-    banner += LLAMA_ASCII_LOGO;
+    banner += lumina_ascii_logo();
     banner += "\n";
     banner += "build      : " + build_info + "\n";
     banner += "GitHub     : " + std::string(lumina_project_github()) + "\n";
