@@ -730,6 +730,121 @@ static std::pair<int, int> test_gradient_accumulation(
     return std::make_pair(npass, ntest);
 }
 
+// Regression test for the non-static graph path used by llama_opt_epoch() (llama-finetune, the
+// trainers): the compute graph is rebuilt for every micro-batch with ggml_opt_prepare_alloc()
+// and ggml_opt_alloc(), and ggml_opt_eval() clears opt_ctx->gb_grad afterwards. The gradient
+// accumulators therefore have to be cleared through the persistent tensors, not via
+// ggml_graph_reset(opt_ctx->gb_grad) (which is a silent no-op there). If they are not cleared
+// every optimizer step applies the sum of all gradients since the start of training.
+static std::pair<int, int> test_gradient_accumulation_nonstatic(
+        ggml_backend_sched_t backend_sched, ggml_backend_t backend) {
+    int ntest = 0;
+    int npass = 0;
+
+    constexpr int64_t opt_period = 2;
+
+    struct ggml_context * ctx_static;
+    {
+        struct ggml_init_params params = {
+            /*.mem_size   =*/ 4*ggml_tensor_overhead(),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        ctx_static = ggml_init(params);
+    }
+
+    struct ggml_tensor * weights = ggml_new_tensor_1d(ctx_static, GGML_TYPE_F32, 1);
+    ggml_set_name(weights, "weights");
+    ggml_set_param(weights);
+    ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors(ctx_static, backend);
+
+    const float w0 = 0.0f;
+    ggml_backend_tensor_set(weights, &w0, 0, sizeof(float));
+
+    ggml_opt_optimizer_params opt_pars = ggml_opt_get_default_optimizer_params(nullptr);
+    opt_pars.sgd.alpha = 1.0f;
+    opt_pars.sgd.wd    = 0.0f;
+
+    struct ggml_opt_params params = ggml_opt_default_params(backend_sched, GGML_OPT_LOSS_TYPE_SUM);
+    params.opt_period       = opt_period;
+    params.optimizer        = GGML_OPT_OPTIMIZER_TYPE_SGD;
+    params.get_opt_pars     = ggml_opt_get_constant_optimizer_params;
+    params.get_opt_pars_ud  = &opt_pars;
+    ggml_opt_context_t opt_ctx = ggml_opt_init(params);
+
+    ggml_opt_result_t result = ggml_opt_result_init();
+
+    // one micro-batch with a constant input of 1: dloss/dweight = 1 for every micro-batch
+    auto eval_micro_batch = [&](bool backward) {
+        struct ggml_init_params cparams = {
+            /*.mem_size   =*/ 1024*ggml_tensor_overhead() + 8*ggml_graph_overhead_custom(GGML_DEFAULT_GRAPH_SIZE, /*grads =*/ true),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+        struct ggml_context * ctx_compute = ggml_init(cparams);
+
+        struct ggml_tensor * inputs  = ggml_new_tensor_1d(ctx_compute, GGML_TYPE_F32, 1);
+        struct ggml_tensor * outputs = ggml_mul(ctx_compute, weights, inputs);
+        ggml_set_name(inputs,  "inputs");
+        ggml_set_name(outputs, "outputs");
+
+        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx_compute, GGML_DEFAULT_GRAPH_SIZE, /*grads =*/ true);
+        ggml_build_forward_expand(gf, outputs);
+
+        ggml_opt_prepare_alloc(opt_ctx, ctx_compute, gf, inputs, outputs);
+        ggml_opt_alloc(opt_ctx, backward);
+
+        const float in = 1.0f;
+        ggml_backend_tensor_set(inputs, &in, 0, sizeof(float));
+        ggml_opt_eval(opt_ctx, result);
+
+        ggml_free(ctx_compute);
+    };
+
+    // 4 accumulation cycles of 2 micro-batches: with correctly cleared accumulators the
+    // step applies a gradient of 2 (i.e. both micro-batches), so the weights are:
+    // 0, -2, -2, -4, -4, -6, -6, -8. If the accumulators are never cleared the applied
+    // gradients grow without bound: 2, 4, 6, 8 -> -2, -6, -12, -20.
+    const float expected[8] = { 0.0f, -2.0f, -2.0f, -4.0f, -4.0f, -6.0f, -6.0f, -8.0f };
+
+    {
+        bool subtest_ok = true;
+        for (int i = 0; i < 8; ++i) {
+            eval_micro_batch(/*backward =*/ true);
+
+            float w;
+            ggml_backend_tensor_get(weights, &w, 0, sizeof(float));
+            subtest_ok = subtest_ok && almost_equal(w, expected[i], 1e-6);
+        }
+        helper_after_test(GGML_OPT_OPTIMIZER_TYPE_SGD, __func__, /*high_level =*/ false,
+                          ", opt_period=2, phase=training", "weights", subtest_ok, ntest, npass);
+    }
+
+    // a forward-only evaluation (validation / KV-cache rebuild on --resume) must not advance
+    // the accumulation phase, otherwise the cycle-start reset is skipped at the next epoch
+    {
+        eval_micro_batch(/*backward =*/ false);
+
+        bool subtest_ok = true;
+        for (int i = 0; i < 4; ++i) {
+            eval_micro_batch(/*backward =*/ true);
+
+            float w;
+            ggml_backend_tensor_get(weights, &w, 0, sizeof(float));
+            subtest_ok = subtest_ok && almost_equal(w, expected[i] - 8.0f, 1e-6);
+        }
+        helper_after_test(GGML_OPT_OPTIMIZER_TYPE_SGD, __func__, /*high_level =*/ false,
+                          ", opt_period=2, phase=training_after_forward", "weights", subtest_ok, ntest, npass);
+    }
+
+    ggml_opt_result_free(result);
+    ggml_opt_free(opt_ctx);
+    ggml_backend_buffer_free(buf);
+    ggml_free(ctx_static);
+
+    return std::make_pair(npass, ntest);
+}
+
 float constexpr g_sgd_lr = 1e-4f;
 
 int constexpr g_sgd_epochs = 900;
@@ -888,6 +1003,11 @@ static std::pair<int, int> test_backend(
     }
     {
         std::pair<int, int> partial = test_regression(optim, backend_sched, backend);
+        npass += partial.first;
+        ntest += partial.second;
+    }
+    {
+        std::pair<int, int> partial = test_gradient_accumulation_nonstatic(backend_sched, backend);
         npass += partial.first;
         ntest += partial.second;
     }

@@ -6701,6 +6701,24 @@ static void ggml_hash_map_free(struct hash_map * map) {
 // else if there is no gradient for tensor, set the corresponding value
 // else, just add/subtract/etc. the gradients
 
+// Gradient views produced by the backward pass (transpose / permute / view ...) have a
+// non-contiguous first dimension. The in-place accumulation ops (ADD / SUB / ACC / ADD1)
+// require their destination rows to be contiguous, so materialise such accumulators first.
+// Real parameter accumulators (`grad_accs`) are always freshly allocated and contiguous.
+static struct ggml_tensor * ggml_grad_accumulator(
+        struct ggml_context * ctx,
+        struct ggml_cgraph  * cgraph,
+        size_t                isrc) {
+    struct ggml_tensor * g = cgraph->grads[isrc];
+
+    if (g != NULL && g->nb[0] != ggml_type_size(g->type) && cgraph->grad_accs[isrc] == NULL) {
+        g = ggml_cont(ctx, g);
+        cgraph->grads[isrc] = g;
+    }
+
+    return g;
+}
+
 static void ggml_add_or_set(
         struct ggml_context * ctx,
         struct ggml_cgraph  * cgraph,
@@ -6709,7 +6727,7 @@ static void ggml_add_or_set(
     struct ggml_tensor * src = cgraph->visited_hash_set.keys[isrc];
     GGML_ASSERT(src);
     if (cgraph->grads[isrc]) {
-        cgraph->grads[isrc] = ggml_add_impl(ctx, cgraph->grads[isrc], tensor, /*inplace =*/ cgraph->grad_accs[isrc]);
+        cgraph->grads[isrc] = ggml_add_impl(ctx, ggml_grad_accumulator(ctx, cgraph, isrc), tensor, /*inplace =*/ cgraph->grad_accs[isrc]);
     } else {
         cgraph->grads[isrc] = tensor;
     }
@@ -6729,7 +6747,7 @@ static void ggml_acc_or_set(
     struct ggml_tensor * src = cgraph->visited_hash_set.keys[isrc];
     GGML_ASSERT(src);
     if (cgraph->grads[isrc]) {
-        cgraph->grads[isrc] = ggml_acc_impl(ctx, cgraph->grads[isrc], tensor, nb1, nb2, nb3, offset, cgraph->grad_accs[isrc]);
+        cgraph->grads[isrc] = ggml_acc_impl(ctx, ggml_grad_accumulator(ctx, cgraph, isrc), tensor, nb1, nb2, nb3, offset, cgraph->grad_accs[isrc]);
     } else {
         struct ggml_tensor * a_zero = ggml_scale(ctx, src, 0.0f); // FIXME this is going to produce NaN if a contains inf/NaN
         cgraph->grads[isrc] = ggml_acc_impl(ctx, a_zero, tensor, nb1, nb2, nb3, offset, false);
@@ -6746,7 +6764,7 @@ static void ggml_add1_or_set(
     struct ggml_tensor * src = cgraph->visited_hash_set.keys[isrc];
     GGML_ASSERT(src);
     if (cgraph->grads[isrc]) {
-        cgraph->grads[isrc] = ggml_add1_impl(ctx, cgraph->grads[isrc], tensor, cgraph->grad_accs[isrc]);
+        cgraph->grads[isrc] = ggml_add1_impl(ctx, ggml_grad_accumulator(ctx, cgraph, isrc), tensor, cgraph->grad_accs[isrc]);
     } else {
         cgraph->grads[isrc] = ggml_repeat(ctx, tensor, src);
     }
@@ -6762,7 +6780,7 @@ static void ggml_sub_or_set(
     struct ggml_tensor * src = cgraph->visited_hash_set.keys[isrc];
     GGML_ASSERT(src);
     if (cgraph->grads[isrc]) {
-        cgraph->grads[isrc] = ggml_sub_impl(ctx, cgraph->grads[isrc], tensor, cgraph->grad_accs[isrc]);
+        cgraph->grads[isrc] = ggml_sub_impl(ctx, ggml_grad_accumulator(ctx, cgraph, isrc), tensor, cgraph->grad_accs[isrc]);
     } else {
         cgraph->grads[isrc] = ggml_neg(ctx, tensor);
     }
@@ -6840,7 +6858,13 @@ static void ggml_compute_backward(
                 ggml_add_or_set(ctx, cgraph, isrc0, grad);
             }
             if (src1_needs_grads) {
-                ggml_sub_or_set(ctx, cgraph, isrc1, grad);
+                // src1 may be broadcast (e.g. the scalar per-chunk gate of the gated delta
+                // net): reduce the gradient back to its shape, like ADD/MUL/DIV do
+                struct ggml_tensor * tmp = grad;
+                if (!ggml_are_same_shape(src0, src1)) {
+                    tmp = ggml_repeat_back(ctx, tmp, src1);
+                }
+                ggml_sub_or_set(ctx, cgraph, isrc1, tmp);
             }
         } break;
         case GGML_OP_MUL: {
@@ -6933,7 +6957,8 @@ static void ggml_compute_backward(
         } break;
         case GGML_OP_MEAN: {
             if (src0_needs_grads) {
-                ggml_add1_or_set(ctx, cgraph, isrc0, ggml_scale_impl(ctx, grad, 1.0f/src0->ne[0], 0.0, false));
+                struct ggml_tensor * g = ggml_is_padded_1d(grad) ? grad : ggml_cont(ctx, grad);
+                ggml_add1_or_set(ctx, cgraph, isrc0, ggml_scale_impl(ctx, g, 1.0f/src0->ne[0], 0.0, false));
             }
         } break;
         case GGML_OP_REPEAT: {
@@ -7091,7 +7116,10 @@ static void ggml_compute_backward(
             if (src0_needs_grads) {
                 float s;
                 memcpy(&s, tensor->op_params, sizeof(float));
-                ggml_add_or_set(ctx, cgraph, isrc0, ggml_scale_impl(ctx, grad, s, 0.0, false));
+                // the gradient of a permuted/transposed value is a view; ggml_scale requires
+                // its input to be padded along the first dimension, so materialise it first
+                struct ggml_tensor * g = ggml_is_padded_1d(grad) ? grad : ggml_cont(ctx, grad);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_scale_impl(ctx, g, s, 0.0, false));
             }
         } break;
         case GGML_OP_SET: {
@@ -7380,6 +7408,167 @@ static void ggml_compute_backward(
                 } //break;
             }
         } break;
+        // ---------------------------------------------------------------------
+        // ops used by the gated-delta-net (hybrid linear attention) forward graph
+        // (qwen3-next / qwen3.5 / kimi-linear style models). Without these cases any
+        // adapter that requires gradients through a linear-attention layer would hit
+        // the "unsupported ggml op for backward pass" abort below, which made models
+        // such as Qwen3.5 impossible to fine-tune.
+        // ---------------------------------------------------------------------
+        case GGML_OP_CONCAT: {
+            const int dim = ggml_get_op_params_i32(tensor, 0);
+            GGML_ASSERT(dim >= 0 && dim < GGML_MAX_DIMS);
+
+            if (src0_needs_grads) {
+                struct ggml_tensor * ga = ggml_view_4d(ctx, grad,
+                        src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                        grad->nb[1], grad->nb[2], grad->nb[3], 0);
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_cont(ctx, ga));
+            }
+            if (src1_needs_grads) {
+                struct ggml_tensor * gb = ggml_view_4d(ctx, grad,
+                        src1->ne[0], src1->ne[1], src1->ne[2], src1->ne[3],
+                        grad->nb[1], grad->nb[2], grad->nb[3],
+                        src0->ne[dim] * grad->nb[dim]);
+                ggml_add_or_set(ctx, cgraph, isrc1, ggml_cont(ctx, gb));
+            }
+        } break;
+        case GGML_OP_PAD: {
+            if (src0_needs_grads) {
+                const int32_t lp0 = ggml_get_op_params_i32(tensor, 0);
+                const int32_t lp1 = ggml_get_op_params_i32(tensor, 2);
+                const int32_t lp2 = ggml_get_op_params_i32(tensor, 4);
+                const int32_t lp3 = ggml_get_op_params_i32(tensor, 6);
+
+                // padding only (no cropping) is used in practice; a negative left pad
+                // would crop the source and is not supported here
+                GGML_ASSERT(lp0 >= 0 && lp1 >= 0 && lp2 >= 0 && lp3 >= 0);
+
+                struct ggml_tensor * g = grad;
+                const size_t offset = lp0*g->nb[0] + lp1*g->nb[1] + lp2*g->nb[2] + lp3*g->nb[3];
+                struct ggml_tensor * gv = ggml_view_4d(ctx, g,
+                        src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3],
+                        g->nb[1], g->nb[2], g->nb[3], offset);
+
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_cont(ctx, gv));
+            }
+        } break;
+        case GGML_OP_TRI: {
+            if (src0_needs_grads) {
+                const enum ggml_tri_type ttype =
+                    (enum ggml_tri_type) ggml_get_op_params_i32(tensor, 0);
+
+                // y = mask(x) with zeros outside the triangle -> dx = mask(dy)
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_tri(ctx, ggml_cont(ctx, grad), ttype));
+            }
+        } break;
+        case GGML_OP_FILL: {
+            // y = constant -> no gradient flows to the input
+        } break;
+        case GGML_OP_DIAG: {
+            if (src0_needs_grads) {
+                // y[i, i] = x[i] -> dx[i] = dy[i, i]
+                struct ggml_tensor * one = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                        src0->ne[0], 1, src0->ne[2], src0->ne[3]), 1.0f);
+                struct ggml_tensor * dmask = ggml_diag(ctx, one);
+                struct ggml_tensor * d = ggml_mul(ctx, ggml_cont(ctx, grad), dmask);
+                struct ggml_tensor * s = ggml_sum_rows(ctx, d); // [1, n, ne2, ne3]
+                struct ggml_tensor * gv = ggml_reshape_4d(ctx, s,
+                        src0->ne[0], src0->ne[1], src0->ne[2], src0->ne[3]);
+
+                ggml_add_or_set(ctx, cgraph, isrc0, gv);
+            }
+        } break;
+        case GGML_OP_CUMSUM: {
+            if (src0_needs_grads) {
+                // y[i] = sum_{j<=i} x[j] -> dx[j] = sum_{i>=j} dy[i]
+                // the reverse cumulative sum is an upper-triangular ones matmul
+                const int64_t n = src0->ne[0];
+                struct ggml_tensor * ones = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                        n, n, 1, 1), 1.0f);
+                struct ggml_tensor * m = ggml_tri(ctx, ones, GGML_TRI_TYPE_UPPER_DIAG);
+
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_mul_mat(ctx, m, ggml_cont(ctx, grad)));
+            }
+        } break;
+        case GGML_OP_SOLVE_TRI: {
+            // forward: X = A^{-1} B with A lower triangular (left solve, non-unit diagonal)
+            // with G = dL/dX:
+            //   dL/dB = A^{-T} G
+            //   dL/dA = -(dL/dB) X^T
+            // only lower-left solves are available, so use the explicit inverse
+            struct ggml_tensor * a   = ggml_cont(ctx, src0);
+            struct ggml_tensor * one = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+                    a->ne[0], 1, a->ne[2], a->ne[3]), 1.0f);
+            struct ggml_tensor * ai  = ggml_solve_tri(ctx, a, ggml_diag(ctx, one), true, true, false);
+            // ggml_mul_mat(u, v) computes M(v) @ M(u)^T (with M(t)[i][j] = t[j][i])
+            struct ggml_tensor * y = ggml_mul_mat(ctx,
+                    ggml_cont(ctx, ggml_transpose(ctx, grad)),
+                    ggml_cont(ctx, ggml_transpose(ctx, ai)));   // M(y) = A^-T G
+
+            if (src1_needs_grads) {
+                ggml_add_or_set(ctx, cgraph, isrc1, y);
+            }
+            if (src0_needs_grads) {
+                struct ggml_tensor * da = ggml_mul_mat(ctx,
+                        ggml_cont(ctx, tensor), y);             // M(da) = (A^-T G) X^T
+                ggml_add_or_set(ctx, cgraph, isrc0, ggml_neg(ctx, da));
+            }
+        } break;
+        case GGML_OP_SSM_CONV: {
+            // forward: y[ch, t, s] = sum_k c[k, ch] * x[t + k, ch, s]
+            struct ggml_tensor * x = src0; // [d_conv - 1 + n_t, d_inner, n_s]
+            struct ggml_tensor * c = src1; // [d_conv, d_inner]
+
+            const int64_t d_conv  = c->ne[0];
+            const int64_t d_inner = c->ne[1];
+            const int64_t ncs     = x->ne[0];
+            const int64_t n_t     = ncs - d_conv + 1;
+            const int64_t n_s     = x->ne[2];
+
+            GGML_ASSERT(n_t >= 1);
+
+            if (src0_needs_grads || src1_needs_grads) {
+                // [n_t, d_inner, n_s] -- time on the first axis, like the source
+                struct ggml_tensor * gd_t = ggml_cont(ctx, ggml_permute(ctx, grad, 1, 0, 2, 3));
+
+                if (src0_needs_grads) {
+                    struct ggml_tensor * gx = NULL;
+                    for (int64_t k = 0; k < d_conv; ++k) {
+                        // dx[t + k] += c[k] * dy[t]
+                        struct ggml_tensor * term = ggml_pad_ext(ctx, gd_t,
+                                (int) k, (int) (ncs - n_t - k), 0, 0, 0, 0, 0, 0);
+                        struct ggml_tensor * ck = ggml_cont(ctx, ggml_view_2d(ctx, c,
+                                1, d_inner, c->nb[1], k*c->nb[0]));
+
+                        term = ggml_mul(ctx, term, ck); // broadcast over time and sequences
+                        gx   = gx ? ggml_add(ctx, gx, term) : term;
+                    }
+                    ggml_add_or_set(ctx, cgraph, isrc0, gx);
+                }
+                if (src1_needs_grads) {
+                    // dc[k, ch] = sum_{t,s} dy[ch, t, s] * x[t + k, ch, s]
+                    struct ggml_tensor * gc = NULL;
+                    for (int64_t k = 0; k < d_conv; ++k) {
+                        struct ggml_tensor * xk = ggml_view_3d(ctx, x,
+                                n_t, d_inner, n_s, x->nb[1], x->nb[2], k*x->nb[0]);
+                        struct ggml_tensor * p  = ggml_mul(ctx, gd_t, xk); // [n_t, d_inner, n_s]
+                        struct ggml_tensor * sr = ggml_sum_rows(ctx, p);  // [1, d_inner, n_s]
+
+                        // sum over the sequence axis -> [1, d_inner]
+                        struct ggml_tensor * row = NULL;
+                        for (int64_t is = 0; is < n_s; ++is) {
+                            struct ggml_tensor * ss = ggml_cont(ctx, ggml_view_3d(ctx, sr,
+                                    1, d_inner, 1, sr->nb[1], sr->nb[2], is*sr->nb[2]));
+                            ss  = ggml_reshape_2d(ctx, ss, 1, d_inner);
+                            row = row ? ggml_add(ctx, row, ss) : ss;
+                        }
+                        gc = gc ? ggml_concat(ctx, gc, row, 0) : row;
+                    }
+                    ggml_add_or_set(ctx, cgraph, isrc1, gc);
+                }
+            }
+        } break;
         case GGML_OP_NONE: {
             // noop
         } break;
@@ -7579,8 +7768,10 @@ void ggml_build_backward_expand(
         }
 
         // inplace operations are currently not supported
+        // (GGML_OP_SET is allowed: its backward pass is implemented and the gated-delta-net
+        //  chunked forward executes the per-chunk state accumulation with ggml_set_inplace)
         GGML_ASSERT(!node->view_src || node->op == GGML_OP_CPY || node->op == GGML_OP_SET_ROWS || node->op == GGML_OP_VIEW ||
-            node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE);
+            node->op == GGML_OP_RESHAPE || node->op == GGML_OP_PERMUTE || node->op == GGML_OP_TRANSPOSE || node->op == GGML_OP_SET);
 
         const size_t ihash = ggml_hash_find(&cgraph->visited_hash_set, node);
         GGML_ASSERT(ihash != GGML_HASHSET_FULL);

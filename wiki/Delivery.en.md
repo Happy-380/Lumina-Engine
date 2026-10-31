@@ -174,7 +174,7 @@ C:\Lumina-Engine\
 ```bat
 cd C:\Lumina-Engine\Lumina-Engine-Bin
 
-REM 1) Banner: should show Build 24 (Based on llama.cpp b-10991)
+REM 1) Banner: should show Build 26 (Based on llama.cpp b-10991)
 Lumina-Engine-cli.exe --version
 Lumina-Engine-server.exe --help
 Lumina-Engine-train.exe --version
@@ -192,7 +192,7 @@ set GGML_Q1_LUT_DEBUG=
 
 Expected:
 
-- Banner shows `Build 24 (Based on llama.cpp b-10991)`; every console (`cli` / `server` / `train`
+- Banner shows `Build 26 (Based on llama.cpp b-10991)`; every console (`cli` / `server` / `train`
   / ...) prints the same ASCII logo + build number + project links at startup;
 - `-p "The capital of France is"` prints `Paris.`;
 - 54 files in the delivery directory;

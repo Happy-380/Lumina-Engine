@@ -66,6 +66,7 @@ struct ggml_opt_context {
     bool static_graphs           = false;
     bool eval_ready              = false;
     std::vector<struct ggml_tensor *> grad_accs;
+    std::vector<char>                 grad_acc_is_loss; // parallel to grad_accs, 1 for a loss tensor
     std::vector<struct ggml_tensor *> grad_m;
     std::vector<struct ggml_tensor *> grad_v;
 
@@ -89,10 +90,45 @@ struct ggml_opt_result {
     std::vector<float>   loss;
     std::vector<int32_t> pred;
     int64_t              ncorrect = 0;
+    int64_t              nlabeled = 0; // label rows that carry a real (non-masked) label
 
     int64_t opt_period         = -1;
     bool    loss_per_datapoint = false;
 };
+
+// Clear the persistent gradient accumulators, i.e. start a new accumulation cycle.
+//
+// The accumulators live in ctx_static and are shared by every graph that is built for the
+// context. With static graphs opt_ctx->gb_grad is a stable graph and ggml_graph_reset()
+// could be used, but with the non-static graph path (ggml_opt_prepare_alloc() +
+// ggml_opt_build() for every micro-batch, used by llama_opt_epoch() -> llama-finetune and
+// the other trainers) ggml_opt_eval() sets opt_ctx->gb_grad back to nullptr. Calling
+// ggml_graph_reset(opt_ctx->gb_grad) there is a silent no-op, so the accumulators were
+// never cleared and every optimizer step applied the sum of all gradients since the
+// beginning of training instead of the current step's gradient.
+static void ggml_opt_zero_grad_accs(ggml_opt_context_t opt_ctx) {
+    GGML_ASSERT(opt_ctx->grad_acc_is_loss.size() == opt_ctx->grad_accs.size());
+    for (size_t i = 0; i < opt_ctx->grad_accs.size(); ++i) {
+        struct ggml_tensor * acc = opt_ctx->grad_accs[i];
+        if (acc == nullptr) {
+            continue;
+        }
+        if (opt_ctx->grad_acc_is_loss[i]) {
+            GGML_ASSERT(ggml_is_scalar(acc));
+            GGML_ASSERT(acc->type == GGML_TYPE_F32);
+
+            const float onef = 1.0f;
+            if (acc->buffer) {
+                ggml_backend_tensor_set(acc, &onef, 0, sizeof(float));
+            } else {
+                GGML_ASSERT(acc->data);
+                *((float *) acc->data) = onef;
+            }
+        } else {
+            ggml_set_zero(acc);
+        }
+    }
+}
 
 // ====== Dataset ======
 
@@ -605,10 +641,12 @@ static void ggml_opt_build(ggml_opt_context_t opt_ctx) {
 
         const int n_nodes = opt_ctx->gf->n_nodes;
         opt_ctx->grad_accs.resize(n_nodes);
+        opt_ctx->grad_acc_is_loss.assign(n_nodes, 0);
         for (int i = 0; i < n_nodes; ++i) {
             ggml_tensor * node = opt_ctx->gf->nodes[i];
             if ((accumulate && (node->flags & GGML_TENSOR_FLAG_PARAM)) || (node->flags & GGML_TENSOR_FLAG_LOSS)) {
                 opt_ctx->grad_accs[i] = ggml_new_tensor(opt_ctx->ctx_static, GGML_TYPE_F32, GGML_MAX_DIMS, node->ne);
+                opt_ctx->grad_acc_is_loss[i] = (node->flags & GGML_TENSOR_FLAG_LOSS) != 0;
             } else {
                 opt_ctx->grad_accs[i] = nullptr;
             }
@@ -745,7 +783,7 @@ void ggml_opt_reset(ggml_opt_context_t opt_ctx, bool optimizer) {
         ggml_graph_reset(opt_ctx->gb_opt);
         opt_ctx->iter = 1;
     } else {
-        ggml_graph_reset(opt_ctx->gb_grad);
+        ggml_opt_zero_grad_accs(opt_ctx);
     }
 }
 
@@ -800,6 +838,12 @@ void ggml_opt_result_reset(ggml_opt_result_t result) {
     result->loss.clear();
     result->pred.clear();
     result->ncorrect = 0;
+    result->nlabeled = 0;
+}
+
+void ggml_opt_result_add_nlabeled(ggml_opt_result_t result, int64_t nlabeled) {
+    GGML_ASSERT(nlabeled >= 0);
+    result->nlabeled += nlabeled;
 }
 
 void ggml_opt_result_ndata(ggml_opt_result_t result, int64_t * ndata) {
@@ -825,20 +869,25 @@ void ggml_opt_result_loss(ggml_opt_result_t result, double * loss, double * unc)
         sum_squared += loss_scaled*loss_scaled;
     }
 
+    // Masked label rows are all-zero one-hot vectors: they add exactly nothing to the loss,
+    // but they are still part of the per-row average. When the caller reported how many rows
+    // were actually labelled, rescale so the value is a per-labelled-token loss (this is
+    // reporting only -- the graph, the loss tensor and the gradients are untouched).
+    const bool   per_labeled = result->loss_per_datapoint && result->nlabeled > 0 && result->nlabeled < result->ndata;
+    const double scale       = per_labeled ? double(result->ndata)/double(result->nlabeled) : 1.0;
+
     const double mean = sum/nbatches;
-    *loss = result->loss_per_datapoint ? mean : sum;
+    *loss = (result->loss_per_datapoint ? mean : sum)*scale;
 
-    if (!unc) {
-        return;
+    if (unc) {
+        if (nbatches < 2) {
+            *unc = NAN;
+            return;
+        }
+
+        const double var_sum = sum_squared/nbatches - mean*mean; // variance without Bessel's correction, i.e. nbatches/(nbatches-1)
+        *unc = (result->loss_per_datapoint ? sqrt(var_sum / (nbatches - 1)) : sqrt(var_sum * nbatches/(nbatches - 1)))*scale;
     }
-
-    if (nbatches < 2) {
-        *unc = NAN;
-        return;
-    }
-
-    const double var_sum = sum_squared/nbatches - mean*mean; // variance without Bessel's correction, i.e. nbatches/(nbatches-1)
-    *unc = result->loss_per_datapoint ? sqrt(var_sum / (nbatches - 1)) : sqrt(var_sum * nbatches/(nbatches - 1));
 }
 
 void ggml_opt_result_pred(ggml_opt_result_t result, int32_t * pred) {
@@ -848,14 +897,18 @@ void ggml_opt_result_pred(ggml_opt_result_t result, int32_t * pred) {
 }
 
 void ggml_opt_result_accuracy(ggml_opt_result_t result, double * accuracy, double * unc) {
-    *accuracy = result->ncorrect >= 0 ? double(result->ncorrect) / double(result->ndata) : NAN;
+    // same normalisation as ggml_opt_result_loss(): masked rows must not count as
+    // (necessarily wrong) predictions, see ggml_opt_result_add_nlabeled()
+    const int64_t ndata = result->nlabeled > 0 && result->nlabeled < result->ndata ? result->nlabeled : result->ndata;
+
+    *accuracy = result->ncorrect >= 0 ? double(result->ncorrect) / double(ndata) : NAN;
 
     if (!unc) {
         return;
     }
 
-    *unc = result->ncorrect >= 0 && result->ndata >= 2 ?
-        sqrt((*accuracy) * (1.0 - (*accuracy)) / double(result->ndata - 1)) : NAN;
+    *unc = result->ncorrect >= 0 && ndata >= 2 ?
+        sqrt((*accuracy) * (1.0 - (*accuracy)) / double(ndata - 1)) : NAN;
 }
 
 // ====== Computation ======
@@ -875,9 +928,14 @@ void ggml_opt_prepare_alloc(
 
 void ggml_opt_alloc(ggml_opt_context_t opt_ctx, bool backward) {
     GGML_ASSERT(!opt_ctx->eval_ready);
-    if (opt_ctx->build_type == GGML_OPT_BUILD_TYPE_OPT && opt_ctx->opt_period > 1 && opt_ctx->opt_i == 0) {
-        ggml_graph_reset(opt_ctx->gb_grad);
+
+    // first micro-batch of a new gradient-accumulation cycle: clear the accumulators.
+    // this uses the persistent accumulators directly because opt_ctx->gb_grad is nullptr
+    // here in the non-static-graph path (ggml_opt_eval() resets it after every eval).
+    if (backward && opt_ctx->opt_period > 1 && opt_ctx->opt_i == 0) {
+        ggml_opt_zero_grad_accs(opt_ctx);
     }
+
     if (backward) {
         const int32_t opt_i_next = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
         opt_ctx->build_type = opt_i_next == 0 ? GGML_OPT_BUILD_TYPE_OPT : GGML_OPT_BUILD_TYPE_GRAD;
@@ -973,8 +1031,19 @@ void ggml_opt_eval(ggml_opt_context_t opt_ctx, ggml_opt_result_t result) {
     }
 
     ggml_backend_sched_graph_compute(opt_ctx->backend_sched, opt_ctx->allocated_graph_copy);
+
+    const bool is_backward = opt_ctx->allocated_graph == opt_ctx->gb_grad ||
+                             opt_ctx->allocated_graph == opt_ctx->gb_opt;
+
     opt_ctx->iter += opt_ctx->allocated_graph == opt_ctx->gb_opt;
-    opt_ctx->opt_i = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
+
+    // only graphs that compute gradients consume an accumulation slot: a forward-only
+    // evaluation (validation, KV-cache rebuild on resume) must not shift the phase of the
+    // accumulation cycle, otherwise the cycle-start reset is skipped and stale gradients
+    // are folded into the next optimizer step.
+    if (is_backward) {
+        opt_ctx->opt_i = (opt_ctx->opt_i + 1) % opt_ctx->opt_period;
+    }
 
     if (!opt_ctx->static_graphs) {
         opt_ctx->gf                   = nullptr;
@@ -1122,6 +1191,25 @@ void ggml_opt_epoch_callback_progress_bar(
     double accuracy_unc;
     ggml_opt_result_accuracy(result, &accuracy, &accuracy_unc);
 
+    // With fewer than 2 batches the uncertainties are undefined: print the value alone
+    // instead of "value±nan" (which happens for the very first micro-batch of every loop).
+    char loss_str[96];
+    char acc_str[64];
+    if (std::isfinite(loss) && std::isfinite(loss_unc)) {
+        snprintf(loss_str, sizeof(loss_str), "loss=%.5lf±%.5lf", loss, loss_unc);
+    } else if (std::isfinite(loss)) {
+        snprintf(loss_str, sizeof(loss_str), "loss=%.5lf", loss);
+    } else {
+        snprintf(loss_str, sizeof(loss_str), "loss=n/a");
+    }
+    if (std::isfinite(accuracy) && std::isfinite(accuracy_unc)) {
+        snprintf(acc_str, sizeof(acc_str), "acc=%.2lf±%.2lf%%  ", 100.0*accuracy, 100.0*accuracy_unc);
+    } else if (std::isfinite(accuracy)) {
+        snprintf(acc_str, sizeof(acc_str), "acc=%.2lf%%      ", 100.0*accuracy);
+    } else {
+        snprintf(acc_str, sizeof(acc_str), "acc=n/a        ");
+    }
+
     const int64_t t_now_us    = ggml_time_us();
     const int64_t t_ibatch_us = t_now_us - t_start_us;
     int64_t t_ibatch_s = t_ibatch_us / 1000000;
@@ -1192,9 +1280,9 @@ void ggml_opt_epoch_callback_progress_bar(
     const int64_t t_eta_m = t_eta_s / 60;
     t_eta_s -= t_eta_m * 60;
 
-    fprintf(stderr, "] data=%07" PRId64 "/%07" PRId64 " loss=%.5lf±%.5lf acc=%.2lf±%.2lf%% "
+    fprintf(stderr, "] data=%07" PRId64 "/%07" PRId64 " %s %s "
             "t=%02" PRId64 ":%02" PRId64 ":%02" PRId64 " ETA=%02" PRId64 ":%02" PRId64 ":%02" PRId64 " \r",
-            idata, idata_max, loss, loss_unc, 100.0*accuracy, 100.0*accuracy_unc,
+            idata, idata_max, loss_str, acc_str,
             t_ibatch_h, t_ibatch_m, t_ibatch_s, t_eta_h, t_eta_m, t_eta_s);
     if (ibatch == ibatch_max) {
         fprintf(stderr, "\n");

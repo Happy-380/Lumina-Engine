@@ -3421,6 +3421,14 @@ void llama_context::opt_init(struct llama_model * model, struct llama_opt_params
     // makes long-context training spill into swap on memory-constrained machines.
     cparams.training = true;
 
+    // The fused gated-delta-net kernels (qwen3-next / qwen3.5 / kimi-linear) are single
+    // monolithic ops without a backward pass. During training use the equivalent graph
+    // formulations (chunked / autoregressive), for which ggml_compute_backward now has
+    // gradient implementations for every op involved (pad / cumsum / tri / diag /
+    // solve_tri / concat / ssm_conv).
+    cparams.fused_gdn_ar = false;
+    cparams.fused_gdn_ch = false;
+
     model->hparams.n_ctx_train = lopt_params.n_ctx_train > 0 ? lopt_params.n_ctx_train : n_ctx();
     const uint32_t n_batch     = std::min(this->n_batch(),  model->hparams.n_ctx_train);
     const uint32_t n_ubatch    = std::min(this->n_ubatch(), n_batch);
@@ -3614,6 +3622,7 @@ void llama_context::opt_epoch_iter(
                 ggml_set_zero(labels);
                 if (!skip) {
                     const float onef = 1.0f;
+                    int64_t n_labeled = 0;
                     for (uint32_t pos_ubatch = 0; pos_ubatch < n_ubatch; ++pos_ubatch) {
                         const uint32_t ilabel = pos_ctx + pos_batch + pos_ubatch;
                         GGML_ASSERT(labels_sparse[ilabel] < labels->ne[0]);
@@ -3622,7 +3631,13 @@ void llama_context::opt_epoch_iter(
                         // gradient for that position are exactly zero
                         if (labels_sparse[ilabel] >= 0) {
                             ggml_backend_tensor_set(labels, &onef, (pos_ubatch*labels->ne[0] + labels_sparse[ilabel])*sizeof(float), sizeof(float));
+                            ++n_labeled;
                         }
+                    }
+                    // tell the result how many rows really carry a label, so that the reported
+                    // loss/accuracy are normalised over trainable tokens instead of all tokens
+                    if (result != nullptr) {
+                        ggml_opt_result_add_nlabeled(result, n_labeled);
                     }
                 }
             }

@@ -5,7 +5,7 @@
 This wiki documents the repository's **CPU inference optimizations for Bonsai 1-bit (Q1_0)
 models**: principles, implementation, build, delivery, testing and troubleshooting.
 
-> **Current build: Build 24 (Based on llama.cpp b-10991).** Every console tool (`cli` /
+> **Current build: Build 26 (Based on llama.cpp b-10991).** Every console tool (`cli` /
 > `server` / `train` / `bench` / `perplexity` / `quantize` / `imatrix` / `tokenize` /
 > `gguf-split` / `rpc-server`) prints the same Lumina-Engine startup screen at launch
 > (ASCII logo + build number + GitHub / Afdian / Bilibili links). The build number comes from

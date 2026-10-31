@@ -8,7 +8,25 @@
 
 ---
 
-## 0. 控制台统一启动画面（Build 24）
+## 0. 训练梯度累加器修复（Build 26）
+
+`llama-finetune` / `llama_opt_epoch()` 路径（`Lumina-Engine-train`）在
+`n_batch / n_ubatch > 1` 时，旧代码的梯度累加器从未清零：每个优化器步实际应用的是
+**从训练开始到当前步所有历史梯度之和**，更新步长无界增长、loss 线性攀升。
+
+| 文件 | 类型 | 说明 |
+|------|------|------|
+| `ggml/src/ggml-opt.cpp` | 修改 | 新增 `ggml_opt_zero_grad_accs()` + `grad_acc_is_loss`：直接清零持久累加器（loss 置 1），不再依赖非静态图路径下已被置空的 `gb_grad`；`ggml_opt_alloc()` 在 `backward && opt_period > 1 && opt_i == 0` 时调用 |
+| 同上 | 修改 | `ggml_opt_eval()` 只在计算梯度的图上推进 `opt_i`，仅前向求值（验证 / `--resume` 重建 KV cache）不再打乱累加周期 |
+| 同上 | 修改 | `ggml_opt_reset(opt_ctx, false)` 改用 `ggml_opt_zero_grad_accs()` |
+| `tests/test-opt.cpp` | 修改 | 新增 `test_gradient_accumulation_nonstatic` 回归测试（非静态图 + `opt_period>1`） |
+| `CMakeLists.txt` / `tools/rpc/rpc-server.cpp` | 修改 | Build 25 → 26 |
+
+> Build 26 之前产出的 LoRA 检查点/适配器是在污染梯度下训练的，建议废弃并重新训练。
+
+---
+
+## 0.1 控制台统一启动画面（Build 24）
 
 所有控制台工具启动时打印同一套 Lumina-Engine 启动画面（ASCII logo + Build 号 + 项目链接）：
 

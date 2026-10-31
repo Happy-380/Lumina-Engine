@@ -170,7 +170,7 @@ C:\Lumina-Engine\
 ```bat
 cd C:\Lumina-Engine\Lumina-Engine-Bin
 
-REM 1) 版本横幅：应显示 Build 24 (Based on llama.cpp b-10991)
+REM 1) 版本横幅：应显示 Build 26 (Based on llama.cpp b-10991)
 Lumina-Engine-cli.exe --version
 Lumina-Engine-server.exe --help
 Lumina-Engine-train.exe --version
@@ -188,7 +188,7 @@ set GGML_Q1_LUT_DEBUG=
 
 预期：
 
-- 横幅显示 `Build 24 (Based on llama.cpp b-10991)`；`cli` / `server` / `train` 等所有控制台
+- 横幅显示 `Build 26 (Based on llama.cpp b-10991)`；`cli` / `server` / `train` 等所有控制台
   启动时均打印同一套 ASCII logo + Build 号 + 项目链接；
 - `-p "The capital of France is"` 输出 `Paris.`；
 - 交付目录 54 个文件；

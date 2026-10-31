@@ -5,7 +5,7 @@
 本 wiki 详细介绍本仓库对 **Bonsai 1-bit（Q1_0）模型在 CPU 上的推理优化**：
 原理、实现、编译、交付、测试与排障。
 
-> **当前构建：Build 24（Based on llama.cpp b-10991）。** 所有控制台工具（`cli` /
+> **当前构建：Build 26（Based on llama.cpp b-10991）。** 所有控制台工具（`cli` /
 > `server` / `train` / `bench` / `perplexity` / `quantize` / `imatrix` / `tokenize` /
 > `gguf-split` / `rpc-server`）启动时都会打印统一的 Lumina-Engine 启动画面
 > （ASCII logo + Build 号 + GitHub / 爱发电 / Bilibili 链接），Build 号由

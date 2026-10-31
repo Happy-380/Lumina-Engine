@@ -212,6 +212,16 @@ extern "C" {
     GGML_API void ggml_opt_result_pred(    ggml_opt_result_t result, int32_t * pred);                   // writes ndata values
     GGML_API void ggml_opt_result_accuracy(ggml_opt_result_t result, double  * accuracy, double * unc); // writes 1 value
 
+    // Report how many label rows of the batch that is about to be evaluated by the next
+    // ggml_opt_eval() carry a real label (masked rows, e.g. chat history that must not be
+    // trained, are stored as negative labels). Masked rows contribute nothing to the loss or
+    // to the gradient, but they are still part of the row average, which dilutes both the
+    // reported loss and the reported accuracy by the masked fraction. When this is set, the
+    // two getters above normalise by the number of labelled rows instead of all rows, i.e.
+    // they report the loss/accuracy over trainable tokens only. Left unset (0) the values
+    // are exactly what they always were.
+    GGML_API void ggml_opt_result_add_nlabeled(ggml_opt_result_t result, int64_t nlabeled);
+
     // ====== Computation ======
 
     // if not using static graphs, this function must be called prior to ggml_opt_alloc

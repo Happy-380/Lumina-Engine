@@ -402,6 +402,15 @@ static bool lumina_load_dataset(
     return true;
 }
 
+// Datapoint stride in tokens: --dataset-stride when given (clamped to one window), otherwise
+// the default of 50% overlap between consecutive windows (n_ctx/2). Shared by the dataset
+// builder and the validation-padding logic so both agree on how many tokens a datapoint needs.
+static int64_t lumina_stream_stride(int64_t stride_opt, int64_t ne_datapoint) {
+    return stride_opt > 0
+         ? std::min<int64_t>(stride_opt, ne_datapoint)
+         : std::max<int64_t>(1, ne_datapoint / 2);
+}
+
 // Pack one or two token streams into a ggml_opt_dataset. Labels are the next token
 // (standard next-token prediction); masked positions get the sentinel label -1.
 static ggml_opt_dataset_t lumina_dataset_init(
@@ -416,9 +425,7 @@ static ggml_opt_dataset_t lumina_dataset_init(
     // A stride of n_ctx trains every token exactly once and halves the epoch time (each
     // token is otherwise the target of two different windows). It is user-selectable so the
     // existing training semantics stay the default; clamp to n_ctx so no token is skipped.
-    const int64_t stride       = stride_opt > 0
-                               ? std::min<int64_t>(stride_opt, ne_datapoint)
-                               : std::max<int64_t>(1, ne_datapoint / 2);
+    const int64_t stride       = lumina_stream_stride(stride_opt, ne_datapoint);
 
     auto ndata_of = [&](int64_t n_tokens) -> int64_t {
         if (n_tokens <= ne_datapoint + 1) {
@@ -440,6 +447,12 @@ static ggml_opt_dataset_t lumina_dataset_init(
     } else {
         ndata_val   = (int64_t) (ndata_train_all * val_split);
         ndata_train = ndata_train_all - ndata_val;
+    }
+
+    if (have_val_file && ndata_val <= 0) {
+        LOG_WRN("%s: the validation stream is too short for one window of %" PRId64 " tokens; "
+                "no validation loss will be reported (use a longer --dataset-val)\n",
+                __func__, ne_datapoint);
     }
 
     if (ndata_train <= 0) {
@@ -954,6 +967,24 @@ int main(int argc, char ** argv) {
             if (!lumina_load_dataset(ctx, model, params, params.dataset_val, val_stream, tmpls, tmpls_ready)) {
                 return 1;
             }
+
+            // A validation set is typically small (a handful of held-out records). One
+            // validation datapoint is a full n_ctx window, and lumina_dataset_init() needs
+            // n_tokens >= n_ctx + 1 + stride to emit even a single one -- otherwise the run
+            // silently trains with *zero* validation datapoints ("0 val datapoints") and, if
+            // it is the only set, never reports a validation loss at all. Pad the tail with
+            // masked tokens instead: attention is causal, so the padding cannot influence the
+            // prediction of any real token, and mask = 0 keeps the padding out of the loss.
+            const int64_t stride_val = lumina_stream_stride(params.dataset_stride, n_ctx_train);
+            const int64_t n_needed   = n_ctx_train + 1 + stride_val;
+            const int64_t n_have     = (int64_t) val_stream.tokens.size();
+            if (n_have > 1 && n_have < n_needed) {
+                LOG_WRN("%s: validation set is shorter than one training window (%" PRId64 " tokens, a window is %" PRId64 "); "
+                        "padding with %" PRId64 " masked tokens so the whole set is still evaluated\n",
+                        __func__, n_have, n_ctx_train, n_needed - n_have);
+                val_stream.tokens.resize((size_t) n_needed, 0);
+                val_stream.trainable.resize((size_t) n_needed, 0);
+            }
         }
     } else {
         if (params.prompt.empty()) {
@@ -971,6 +1002,23 @@ int main(int argc, char ** argv) {
                 __func__, train_stream.tokens.size(), n_ctx_train);
         LOG_ERR("%s: provide more data via --dataset, or reduce -c (the context is rounded up to a multiple of 256).\n", __func__);
         return 1;
+    }
+
+    // A dataset that yields no trainable token produces an all-masked training stream: every
+    // label is -1, the loss stays 0, no gradient is ever applied and a multi-hour run is
+    // wasted. This happens when the chat template renders nothing usable (e.g. a shell or
+    // batch file mangled the `%` of `{% ... %}`), so refuse to start instead of running dry.
+    {
+        const size_t n_trainable = (size_t) std::count(train_stream.trainable.begin(), train_stream.trainable.end(), (uint8_t) 1);
+        if (n_trainable == 0) {
+            LOG_ERR("%s: the training set has no trainable token (check --dataset-chat-template / --mask-history).\n", __func__);
+            return 1;
+        }
+        if (n_trainable * 100 < train_stream.tokens.size()) {
+            LOG_WRN("%s: only %.1f%% of the training tokens are trainable (%zu / %zu) -- is the chat template correct?\n",
+                    __func__, 100.0 * (double) n_trainable / (double) train_stream.tokens.size(),
+                    n_trainable, train_stream.tokens.size());
+        }
     }
 
     int64_t idata_split = 0;

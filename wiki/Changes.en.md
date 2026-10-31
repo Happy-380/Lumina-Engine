@@ -9,7 +9,27 @@ unaffected.
 
 ---
 
-## 0. Unified console startup screen (Build 24)
+## 0. Training gradient-accumulator fix (Build 26)
+
+For the `llama-finetune` / `llama_opt_epoch()` path (`Lumina-Engine-train`) with
+`n_batch / n_ubatch > 1`, the old code never cleared the gradient accumulators: every optimizer
+step applied the **sum of all gradients since the start of training**, so the update magnitude
+grew without bound and the loss climbed (approximately linearly).
+
+| File | Type | Description |
+|------|------|-------------|
+| `ggml/src/ggml-opt.cpp` | modified | adds `ggml_opt_zero_grad_accs()` + `grad_acc_is_loss`: clears the persistent accumulators directly (loss set to 1) instead of relying on `gb_grad`, which is `nullptr` in the non-static-graph path; called from `ggml_opt_alloc()` when `backward && opt_period > 1 && opt_i == 0` |
+| same | modified | `ggml_opt_eval()` only advances `opt_i` for graphs that compute gradients, so forward-only evaluations (validation / KV-cache rebuild on `--resume`) no longer shift the accumulation phase |
+| same | modified | `ggml_opt_reset(opt_ctx, false)` uses `ggml_opt_zero_grad_accs()` |
+| `tests/test-opt.cpp` | modified | adds the `test_gradient_accumulation_nonstatic` regression test (non-static graphs + `opt_period > 1`) |
+| `CMakeLists.txt` / `tools/rpc/rpc-server.cpp` | modified | Build 25 → 26 |
+
+> LoRA checkpoints/adapters produced before Build 26 were trained with contaminated gradients;
+> discard them and retrain.
+
+---
+
+## 0.1 Unified console startup screen (Build 24)
 
 Every console tool now prints the same Lumina-Engine startup screen (ASCII logo + build number +
 project links):

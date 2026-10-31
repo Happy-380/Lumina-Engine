@@ -288,7 +288,7 @@ static std::vector<ggml_backend_dev_t> get_devices(const rpc_server_params & par
 }
 
 #ifndef LUMINA_RPC_BUILD_NUMBER
-#define LUMINA_RPC_BUILD_NUMBER 24
+#define LUMINA_RPC_BUILD_NUMBER 26
 #endif
 
 // Lumina-Engine: the RPC backend server is a console tool too, but it deliberately does not

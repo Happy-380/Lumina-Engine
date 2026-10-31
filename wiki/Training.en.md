@@ -11,6 +11,11 @@ This repository ships a **C++ training engine**, `Lumina-Engine-train`, for fine
 > adapters (LoRA A/B matrices) are trained. No dequantize → train → requantize round trip is
 > needed, and the memory footprint stays small.
 
+> ⚠️ **Build 26 fixed a critical bug: the gradient accumulators were never cleared.** Older
+> builds applied the sum of all gradients since the start of training at every optimizer step,
+> so the update magnitude grew without bound and the loss climbed approximately linearly.
+> LoRA checkpoints/adapters produced before Build 26 should be discarded and retrained.
+
 ---
 
 ## 1. Why not "directly fine-tune the quantized weights"

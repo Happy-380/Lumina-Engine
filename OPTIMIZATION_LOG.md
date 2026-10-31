@@ -7,6 +7,43 @@
 
 ---
 
+## Build 26：修复训练梯度累加器从不清零（loss 线性攀升）
+
+**现象**：`llama-finetune` / `llama_opt_epoch()` 路径（`Lumina-Engine-train`）在
+`n_batch / n_ubatch > 1` 时，优化器每步实际使用的是从训练开始到当前步的**所有历史梯度之和**，
+更新步长无界增长，loss 持续、近似线性上升（Build 25 的 Qwen3.5 实验 2.2 → 6.5 即此问题）。
+
+**根因**：
+- `ggml_opt` 的梯度累加器 `grad_accs` 是 `ctx_static` 中的持久张量，每 `opt_period` 个
+  micro-batch 清零一次。
+- 非静态图路径（`llama_context::opt_epoch_iter()` 每个 micro-batch 都调用
+  `ggml_opt_prepare_alloc()` + `ggml_opt_alloc()` 重新构图）下，`ggml_opt_eval()` 每次求值后
+  把 `opt_ctx->gb_grad` 置为 `nullptr`；原清零代码 `ggml_graph_reset(opt_ctx->gb_grad)`
+  于是变成静默 no-op，累加器从未清零。
+- 另有相位问题：仅前向求值（验证 / `--resume` 重建 KV cache）也会推进 `opt_i`，
+  导致跨 epoch 的首次周期同样跳过清零。
+
+**修复**：
+- `ggml/src/ggml-opt.cpp`：新增 `ggml_opt_zero_grad_accs()`，直接操作持久累加器
+  （参数清零，loss 累加器置 1）并记录 `grad_acc_is_loss`；`ggml_opt_alloc()` 在
+  `backward && opt_period > 1 && opt_i == 0` 时调用；`ggml_opt_eval()` 仅在梯度图上推进
+  `opt_i`；`ggml_opt_reset(..., false)` 也改用该函数。
+- `tests/test-opt.cpp`：新增 `test_gradient_accumulation_nonstatic` 回归测试。
+
+**验证**（非静态图，`opt_period=2`，每 micro-batch 梯度 = 1，SGD α=1）：
+
+| | step 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 旧（累加器不清零） | 0 | -2 | -2 | -6 | -6 | -12 | -12 | -20 |
+| 新（每周期清零） | 0 | -2 | -2 | -4 | -4 | -6 | -6 | -8 |
+
+`test-opt`：120/120（AdamW）+ 48/48（SGD）通过；真实模型冒烟 train loss 3.03 → 2.44、
+val loss ≈ 2.80，持续下降。
+
+**结论**：Build 26 之前产出的 LoRA 检查点是在污染梯度下训练的，建议废弃并重训。
+
+---
+
 ## Build 24：所有控制台统一启动画面
 
 **目标**：所有控制台工具（`cli` / `server` / `train` / `bench` / `perplexity` /

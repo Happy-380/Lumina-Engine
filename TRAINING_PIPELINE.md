@@ -1,7 +1,7 @@
 # Lumina-Engine 三段式训练流程（Stage1 → Stage2 → Stage3）
 
 > 适用：`SmallThinker-4BA0.6B-Instruct`（MoE）QLoRA 三阶段微调
-> 工具：`C:\Lumina-Engine\Lumina-Engine-Bin\Lumina-Engine-train.exe`（Build 24）
+> 工具：`C:\Lumina-Engine\Lumina-Engine-Bin\Lumina-Engine-train.exe`（Build 26）
 >
 > Build 20 起训练已支持长上下文低内存：注意力反向现场重算 + 数据集内存映射，
 > `-c 32768` 在 8 GB 机器上可稳定运行而不进入磁盘交换（详见 `OPTIMIZATION_LOG.md`）。
@@ -18,6 +18,12 @@
 >
 > Build 24 让 `train` 与所有其它控制台（`cli` / `server` / `bench` 等）启动时显示同一套
 > Lumina-Engine 启动画面（ASCII logo + Build 号 + 项目链接）。
+>
+> **Build 26 修复了梯度累加器从不清零的严重正确性问题**：非静态图训练路径下
+> `ggml_graph_reset(gb_grad)` 是静默 no-op，优化器每步实际使用“训练开始至今的全部历史梯度
+> 之和”，导致更新步长无界增长、loss 线性攀升。Build 26 起每个优化器步只应用当前累加周期
+> （`n_batch / n_ubatch` 个 micro-batch）的梯度。**Build 26 之前产出的 LoRA 检查点已被污染，
+> 建议废弃并从基座重新训练。**
 > **全程无需合并 LoRA**：每一阶段用 `--init-lora` 在上一阶段的适配器上继续训练，各自单独保存。
 
 ---
