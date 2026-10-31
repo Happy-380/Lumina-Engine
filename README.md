@@ -4,7 +4,7 @@
 
 > 基于 llama.cpp b-10991 的 Windows x86-64 推理 / 压缩 / 训练引擎：为 **Bonsai Q1_0** 提供专用 CPU 内核，同时提供面向更多模型的 **Vulkan 加速、自动设备策略、无损压缩与 QLoRA 训练**。
 
-![Build](https://img.shields.io/badge/build-24-blue)
+![Build](https://img.shields.io/badge/build-26-blue)
 ![llama.cpp](https://img.shields.io/badge/llama.cpp-b10991-green)
 ![Platform](https://img.shields.io/badge/platform-Windows%20x86--64-lightgrey)
 ![License](https://img.shields.io/badge/license-AGPL--3.0-orange)

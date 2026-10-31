@@ -4,7 +4,7 @@
 
 > A Windows x86-64 inference / compression / training engine built on llama.cpp b-10991: dedicated CPU kernels for **Bonsai Q1_0**, plus **Vulkan acceleration, automatic device policy, lossless compression, and QLoRA training** for a wider range of models.
 
-![Build](https://img.shields.io/badge/build-24-blue)
+![Build](https://img.shields.io/badge/build-26-blue)
 ![llama.cpp](https://img.shields.io/badge/llama.cpp-b10991-green)
 ![Platform](https://img.shields.io/badge/platform-Windows%20x86--64-lightgrey)
 ![License](https://img.shields.io/badge/license-AGPL--3.0-orange)
