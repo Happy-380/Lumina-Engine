@@ -313,6 +313,44 @@ K 分块对照（`-p 64 -n 128 -t 6`）：KB=1024 ~11.0、KB=2048 ~11.1、KB=409
 
 ---
 
+## 优化 8：Q4_K GEMV 整块预取（Build 31）
+
+适用于**定量 Q4_K / Q4_K_M 模型**（不是 Q1_0）。`ggml_gemv_q4_K_8x8_q8_K()` 是 repack 之后的
+Q4_K 解码内核（`ggml/src/ggml-cpu/arch/x86/repack.cpp`），CPU 单 token 生成几乎全在它上面。
+
+**诊断**：单线程实测只有 6.0–7.5 GB/s，而同一线程纯流式读上限是 11.6–13.1 GB/s。差这么多说明
+不是带宽不够，而是**访存延迟没被填满**：一个 `block_q4_Kx8`（1152 B）的 8 条 32 B 载入要等上一个
+block 的算术，乱序窗口（~224 uop）覆盖不到 200–300 周期的内存延迟。
+
+**改法**：在 block 循环开头，把**两个 block 之后**要用的整块（18 条 cache line）预取进 L1：
+
+```c
+{
+    const char * pf = (const char *) (b_ptr + b + 2);
+    for (size_t pf_off = 0; pf_off < sizeof(block_q4_Kx8); pf_off += 64) {
+        _mm_prefetch(pf + pf_off, _MM_HINT_T0);
+    }
+}
+```
+
+**关键坑：不要加 `if (b + 2 < nb)` 边界判断。** 热循环里的那次分支/或者被它打断的循环优化，
+比矩阵末尾那几次无用预取贵得多 —— 实测 **-13%**（5.49 vs 6.34 GB/s）。`PREFETCHh` 对无效地址不会
+fault，越过张量末尾是无害的。
+
+**效果**（i5-10400 / 8 GB，后台有训练任务，同进程交错取中位数）：
+
+| 指标 | 改前 | 改后 |
+|---|---:|---:|
+| 内核单线程带宽（18 MiB 矩阵，DRAM 驻留） | 6.00–6.47 GB/s | 6.63–6.78 GB/s（**+13.0%**） |
+| 端到端解码 `tg32`（Qwen3.5-0.8B Q4_K_M，`-t 4`） | 13.66 t/s | 15.53 t/s（**+13.7%**） |
+| 预填充 `pp128` | 79–89 t/s | 87–89 t/s（不变，GEMM 路径未动） |
+| L3 驻留小矩阵（0.56 MiB） | 10.07 GB/s | 10.30 GB/s（噪声内） |
+
+输出与改前**逐位相同**（`memcmp`；贪心解码文本 md5 一致）。测量与复现见
+`llama.cpp-b10991/tests/bench-cpu-kern.cpp` 与 `bench/build_bench_cpu_kern.bat`。
+
+---
+
 ## 为什么没有做 AVX-512 512-bit tile
 
 评估过，但放弃，原因：

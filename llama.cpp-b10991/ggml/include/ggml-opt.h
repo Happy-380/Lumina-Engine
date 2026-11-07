@@ -222,6 +222,13 @@ extern "C" {
     // are exactly what they always were.
     GGML_API void ggml_opt_result_add_nlabeled(ggml_opt_result_t result, int64_t nlabeled);
 
+    // Report how many label rows the batch that is about to be evaluated holds in total
+    // (labelled + masked). Together with ggml_opt_result_add_nlabeled() this lets the getters
+    // above rescale the running mean to a per-labelled-row value correctly: the cross-entropy
+    // kernel divides by all rows, so the rescale factor is (all rows)/(labelled rows) of the
+    // batches that were actually added. Build 29.
+    GGML_API void ggml_opt_result_add_rows(ggml_opt_result_t result, int64_t nrows);
+
     // ====== Computation ======
 
     // if not using static graphs, this function must be called prior to ggml_opt_alloc

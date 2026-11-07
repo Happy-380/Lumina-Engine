@@ -2,13 +2,102 @@
 
 > 🌐 **中文** | [English](Changes.en.md)
 
-本页列出相对于原始 llama.cpp（b10991）的全部改动。核心改动涉及 **5 个文件**：2 个新增、3 个修改
-（二值查表 Q1LUT 全部位于新增的 `q1t.cpp` 内）。所有改动都只影响 `GGML_TYPE_Q1_0` + AVX2 路径，
-其它模型/量化/后端零影响。
+本页列出相对于原始 llama.cpp（b10991）的全部改动。Q1LUT（二值查表）部分涉及 **5 个文件**：2 个新增、3 个修改
+（全部位于新增的 `q1t.cpp` 内），只影响 `GGML_TYPE_Q1_0` + AVX2 路径；另有 Q4_K 解码内核的预取优化（Build 31，见 §0）与各版 CLI/训练修复。
 
 ---
 
-## 0. 训练梯度累加器修复（Build 26）
+## 0. CPU Q4_K GEMV 软件预取（Build 31）
+
+纯 CPU 单 token 生成的时间几乎全在 `ggml_gemv_q4_K_8x8_q8_K`（repack 后的 Q4_K 解码内核）上。
+本机实测该内核单线程只有 6.0–7.5 GB/s，而同一线程纯流式读上限是 11.6–13.1 GB/s —— 说明瓶颈是
+**访存延迟没被填满**，不是带宽。改法：在 block 循环开头把 +2 个 `block_q4_Kx8`（1152 B = 18 条
+cache line）整块 `_mm_prefetch` 进 L1。**不要加 `if (b + 2 < nb)` 边界判断**（热循环里的分支比
+末尾几次无用预取贵得多，实测 -13%；`PREFETCHh` 对无效地址不会 fault）。
+
+| 文件 | 类型 | 说明 |
+|------|------|------|
+| `ggml/src/ggml-cpu/arch/x86/repack.cpp` | 修改 | `ggml_gemv_q4_K_8x8_q8_K()`：整块预取 +2 个 block（`sizeof` 驱动、编译期展开） |
+| `CMakeLists.txt` / `tools/rpc/rpc-server.cpp` | 修改 | Build 30 → 31 |
+| `tests/bench-cpu-kern.cpp` | 新增 | 内核级 A/B 基准：真实内核入口 + 独立标量参考 + 同进程交错测量（仅 `LLAMA_BUILD_TESTS=ON` 时编译，不进交付） |
+| `tests/q4k_gemv_body.inc` / `tests/CMakeLists.txt` | 新增/修改 | 从 `repack.cpp` 原文抽取的内核体（基线副本）+ 基准目标 |
+| `bench/gen_q4k_body.py` / `bench/build_bench_cpu_kern.bat` | 新增 | 生成基线内核体 / 一键构建独立 `build-bench` 树 |
+
+实测（本机 i5-10400 / 8 GB，后台有训练任务，全部按同进程交错比取中位数）：
+
+| 指标 | 改前 | 改后 |
+|---|---:|---:|
+| 内核单线程带宽（18 MiB 矩阵，DRAM 驻留） | 6.00–6.47 GB/s | 6.63–6.78 GB/s（**+13.0%**） |
+| 端到端解码 `tg32`（Qwen3.5-0.8B Q4_K_M，`-t 4`，Clang） | 13.66 t/s | 15.53 t/s（**+13.7%**） |
+| 端到端解码 `tg32`（MSVC 交付变体，逐对中位比） | — | **+13%** |
+| 预填充 `pp128` | 79–89 t/s | 87–89 t/s（无变化，GEMM 路径未动） |
+| L3 驻留小矩阵（0.56 MiB） | 10.07 GB/s | 10.30 GB/s（噪声内） |
+
+正确性：改后内核输出与改前 **逐位相同**（`memcmp`）；真实引擎贪心解码（`--temp 0`）生成文本与
+Build 30 完全一致；7 个实验变体对独立标量参考 `max_abs_err = 4.8e-07`（容差 2.9e-06）。
+
+## 0.1 CLI 多轮对话修复（Build 30）
+
+MoE 模型对话时第二轮及之后只回 `None`：CLI 每轮无条件把 assistant 消息（content 可能为空串）追加进
+历史，一旦某轮没有可见输出，这条空 assistant 轮就永久留在历史里，后续请求变成
+`[user, assistant(""), user]`，严格 chat template 的 MoE 模型从这一轮起只输出占位串。
+同时修掉 stdin 关闭后的死循环（旧版会无限打印 `> `）。
+
+| 文件 | 类型 | 说明 |
+|------|------|------|
+| `tools/cli/cli-context.cpp` | 修改 | 空回复 / 生成失败的轮次不再入历史（打印 `[empty response: ...]`，`--output` 不写空段）；空读取视为 EOF 退出；多模型选择空输入返回失败；每轮结束调 `a.finish()` |
+| `tools/cli/cli-ui.h` | 修改 | `ui::assistant_turn::finish()`：回合结束时强制闭合 `[End thinking]` 并复位颜色/行尾状态 |
+| `CMakeLists.txt` / `tools/rpc/rpc-server.cpp` | 修改 | Build 29 → 30 |
+
+实测：`printf '你好\n1+1=?\n' | cli` 在 Build 29 下会持续输出 `> `（300 s / 1,483,183 行），
+Build 30 正常两轮后 `Exiting...`（37 行，exit 0）。
+
+## 0.2 `--mask-history` 训练路径问题 + 归一化口径（Build 29）
+
+实测：同一 token 流、`-c 4096`，`--mask-history` 的每批 loss ≈ 11.9，`--no-mask-history` ≈ 1.47
+（各跑两次逐位一致；标签核对无误；推理侧同文本 PPL 2.03）。**训练请改用 `--no-mask-history`。**
+
+| 文件 | 类型 | 说明 |
+|------|------|------|
+| `ggml/src/ggml-opt.cpp` / `ggml/include/ggml-opt.h` | 修改 | 新增 `ggml_opt_result_add_rows()`；loss/accuracy 的按标注行归一化改用实际评估行数 `nrows`（原用 `ndata`=数据集点数） |
+| `src/llama-context.cpp` | 修改 | 每评估一个 ubatch 上报 `n_ubatch` 行 |
+| `tools/lumina-train/lumina-train.cpp` | 修改 | 提示 `--mask-history` 的路径问题与推荐配置 |
+| `CMakeLists.txt` / `tools/rpc/rpc-server.cpp` | 修改 | Build 28 → 29 |
+
+## 0.3 训练 loss 显示口径说明（Build 28）
+
+进度条 loss 是累计均值；CE 核按全部行求均值，而 `ggml_opt_result_loss()` 的补偿项
+`ndata/nlabeled` 用「数据集点数 / 已标注行数」（单位不一致）→ 已标注行很少时读数被放大约 8 倍
+（同一文本同位置对照：掩码 11.88 vs 不掩码 1.44）。训练与梯度不受影响。
+`--mask-history` 开启时会打印一条说明，建议用 `--dataset-val` 判断进度。
+
+| 文件 | 类型 | 说明 |
+|------|------|------|
+| `tools/lumina-train/lumina-train.cpp` | 修改 | 删除 `-c > 2048` 告警（结论有误）；新增 `--mask-history` 口径说明 |
+| `CMakeLists.txt` / `tools/rpc/rpc-server.cpp` | 修改 | Build 27 → 28 |
+
+## 0.4 训练数据集磁盘流式落盘（Build 27）
+
+`Lumina-Engine-train` 加载 `--dataset` 时，旧实现把整份语料追加进两个 `std::vector`
+（`int32` token ids + `uint8` 可训练掩码 = **5 B/token**），加载完成后才序列化成临时文件再 mmap。
+1.18 B tokens 的语料因此需要约 **5.9 GiB 追加内存**，小内存机器在加载阶段就失败。
+
+| 文件 | 类型 | 说明 |
+|------|------|------|
+| `tools/lumina-train/lumina-train.cpp` | 修改 | `lumina_token_stream` 增加磁盘 sink（`FILE*` + `sink_n` / `sink_trainable` / `sink_dir`）；`lumina_append()` 直接 `fwrite` ids 与 mask；新增 `lumina_stream_begin()` / `lumina_stream_finish()` / `lumina_stream_discard()` / `lumina_append_padding()`；`lumina_stream_view` 抽出 `map_file()` 并新增 `map_streamed()`，`size()` / `n_trainable()` 统一两种模式 |
+| 同上 | 修改 | 临时目录按进程隔离：`%TEMP%\lumina-train\<tag>-<pid>\`（Build 26 两个实例会写同一个 `train.stream.bin`） |
+| `ggml/src/ggml-opt.cpp` | 修改 | 进度条追加实时 `tok/s`；`ggml_opt_result_loss()` 在 result 还没有 batch 时返回 `NAN`（显示 `loss=n/a`，此前为 0.0）。验证集首行偶见的 `loss=0.00000` 另有原因：该 micro-batch 只含掩码 prompt、无监督目标，Build 26 相同 |
+| 构建脚本（10 个 `.bat`） | 修改 | 去掉硬编码 `C:\Lumina-Engine`，改用 `%~dp0` 相对路径；`build-clang.bat` 传参改为 `--target` |
+| `CMakeLists.txt` / `tools/rpc/rpc-server.cpp` | 修改 | Build 26 → 27 |
+
+写出布局不变（`[n×int32][pad 到 64 B][n×uint8]`），训练器读到的字节逐字节一致：
+
+| 版本 | 加载峰值 RSS（300 M tokens） | 数据集统计 |
+|---|---|---|
+| Build 26 | 2074 MB | 29282 rec / 300,021,789 tok / 278,340 datapoints |
+| Build 27 | **645 MB** | 完全相同 |
+
+## 0.5 训练梯度累加器修复（Build 26）
 
 `llama-finetune` / `llama_opt_epoch()` 路径（`Lumina-Engine-train`）在
 `n_batch / n_ubatch > 1` 时，旧代码的梯度累加器从未清零：每个优化器步实际应用的是
@@ -26,7 +115,7 @@
 
 ---
 
-## 0.1 控制台统一启动画面（Build 24）
+## 0.6 控制台统一启动画面（Build 24）
 
 所有控制台工具启动时打印同一套 Lumina-Engine 启动画面（ASCII logo + Build 号 + 项目链接）：
 
@@ -432,7 +521,7 @@ MoE 走算子 offload 反而慢 ~30%（143 vs 207 t/s），关闭后恢复。
 | `bench/build_haswell.bat` / `bench/build_x64.bat` | 单变体增量编译（开发用） |
 | `bench/bench_lut2.cpp` | Q1LUT 独立内核微基准（含正确性校验） |
 
-**约定**：`Lumina-Engine-Bin` 是唯一的交付目录；旧入口 `C:\Lumina-Engine\llama` 已删除。
+**约定**：`Lumina-Engine-Bin` 是唯一的交付目录；旧入口 `D:\Lumina-Engine\llama` 已删除。
 
 ---
 

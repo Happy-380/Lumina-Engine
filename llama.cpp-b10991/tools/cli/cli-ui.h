@@ -229,6 +229,16 @@ namespace ui {
                 console::flush();
             }
         }
+        // close an open thinking block at the end of the turn, so the next prompt (and any
+        // following status line) is not printed inside the reasoning section
+        void finish() {
+            if (is_inside_reasoning) {
+                console::log("[End thinking]\n\n");
+                console::flush();
+                is_inside_reasoning = false;
+                trailing_newline = true;
+            }
+        }
     };
 
     static void show_error(const std::string & title, const std::string & message = "") {

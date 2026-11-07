@@ -99,6 +99,12 @@ Optionally merge the adapter back into the base model with `Lumina-Engine-export
 | `-c, -b, -ub` | context / batch / micro-batch | see `--help` |
 
 > `-lora-targets` also matches `wq/wk/wv/wo/w1/w2/w3` to cover other naming schemes.
+>
+> ⚠️ **Since Build 30**: when RAM is tight the trainer **shrinks** the target set automatically (log:
+> `lumina_fit_lora_targets: ... dropping MoE expert FFN targets`). On an 8 GB machine the default set of
+> a MoE base degrades from `…,ffn_up,ffn_down` to `attn_q,attn_k,attn_v,attn_output,ffn_gate_inp`
+> (AdamW 7.00 -> 0.25 GiB), i.e. the expert-FFN adapters are not trained at all. Pass `-lora-targets`
+> explicitly to keep them and check that the log never prints `dropping MoE expert FFN targets`.
 
 ### 3.1 Dataset format (`--dataset` / `--dataset-val`)
 
@@ -115,6 +121,9 @@ The dataset is JSONL (one JSON object per line); three shapes are auto-detected:
 * `--mask-history` (default) computes the loss only on `assistant` turns; system / user
   turns and template markers are masked (a `-1` sentinel label makes their loss and gradient
   exactly zero);
+* ⚠️ **For actual training pass `--no-mask-history`**: Build 29 measured the `--mask-history`
+  training path to report a ~8x too high loss (and to produce poor adapters) on the same token
+  stream. The price is that prompt tokens also contribute (~10–15%). See `HANDOFF.md` Build 29/30;
 * plain-text records always contribute over the whole sequence;
 * train and validation sets can be separate files (`--dataset-val`); within a single stream use
   `--val-split`.

@@ -91,6 +91,7 @@ struct ggml_opt_result {
     std::vector<int32_t> pred;
     int64_t              ncorrect = 0;
     int64_t              nlabeled = 0; // label rows that carry a real (non-masked) label
+    int64_t              nrows    = 0; // label rows of the batches added so far (labelled + masked)
 
     int64_t opt_period         = -1;
     bool    loss_per_datapoint = false;
@@ -839,11 +840,17 @@ void ggml_opt_result_reset(ggml_opt_result_t result) {
     result->pred.clear();
     result->ncorrect = 0;
     result->nlabeled = 0;
+    result->nrows    = 0;
 }
 
 void ggml_opt_result_add_nlabeled(ggml_opt_result_t result, int64_t nlabeled) {
     GGML_ASSERT(nlabeled >= 0);
     result->nlabeled += nlabeled;
+}
+
+void ggml_opt_result_add_rows(ggml_opt_result_t result, int64_t nrows) {
+    GGML_ASSERT(nrows >= 0);
+    result->nrows += nrows;
 }
 
 void ggml_opt_result_ndata(ggml_opt_result_t result, int64_t * ndata) {
@@ -854,7 +861,8 @@ void ggml_opt_result_loss(ggml_opt_result_t result, double * loss, double * unc)
     const int64_t nbatches = result->loss.size(); // Number of physical batches.
 
     if (nbatches == 0) {
-        *loss = 0.0;
+        // Nothing evaluated yet: report NAN so callers print "n/a" instead of a fake 0.000.
+        *loss = NAN;
         *unc  = NAN;
         return;
     }
@@ -869,14 +877,24 @@ void ggml_opt_result_loss(ggml_opt_result_t result, double * loss, double * unc)
         sum_squared += loss_scaled*loss_scaled;
     }
 
-    // Masked label rows are all-zero one-hot vectors: they add exactly nothing to the loss,
-    // but they are still part of the per-row average. When the caller reported how many rows
-    // were actually labelled, rescale so the value is a per-labelled-token loss (this is
-    // reporting only -- the graph, the loss tensor and the gradients are untouched).
-    const bool   per_labeled = result->loss_per_datapoint && result->nlabeled > 0 && result->nlabeled < result->ndata;
-    const double scale       = per_labeled ? double(result->ndata)/double(result->nlabeled) : 1.0;
+    // Masked label rows are all-zero one-hot vectors: they add exactly nothing to the loss
+    // numerator, but they are still part of the per-row average that the cross-entropy kernel
+    // computes (it divides by the total number of rows). To report a per-labelled-token loss
+    // the running mean therefore has to be rescaled by
+    //     (rows of the batches added so far) / (labelled rows of the batches added so far).
+    //
+    // Build 29: this used to divide by result->ndata, which is the number of *datapoints* in
+    // the dataset - a different unit and a value that is fixed up front. Whenever a run had
+    // seen only a few labelled rows (the classic case: a long masked prompt at the start of a
+    // long-context window) the printed loss was inflated several-fold and then decayed towards
+    // the true value, which looked exactly like a training failure. See HANDOFF.md (Build 28).
+    // This is reporting only: the graph, the loss tensor and the gradients are untouched.
+    const bool   per_labeled = result->loss_per_datapoint && result->nlabeled > 0 &&
+                               result->nrows > 0 && result->nlabeled < result->nrows;
+    const double scale       = per_labeled ? double(result->nrows)/double(result->nlabeled) : 1.0;
 
     const double mean = sum/nbatches;
+
     *loss = (result->loss_per_datapoint ? mean : sum)*scale;
 
     if (unc) {
@@ -898,8 +916,11 @@ void ggml_opt_result_pred(ggml_opt_result_t result, int32_t * pred) {
 
 void ggml_opt_result_accuracy(ggml_opt_result_t result, double * accuracy, double * unc) {
     // same normalisation as ggml_opt_result_loss(): masked rows must not count as
-    // (necessarily wrong) predictions, see ggml_opt_result_add_nlabeled()
-    const int64_t ndata = result->nlabeled > 0 && result->nlabeled < result->ndata ? result->nlabeled : result->ndata;
+    // (necessarily wrong) predictions, see ggml_opt_result_add_nlabeled()/add_rows().
+    // Build 29: fall back to the number of rows actually evaluated (not to result->ndata,
+    // which is the number of datapoints in the dataset).
+    const int64_t ndata = result->nlabeled > 0 ? result->nlabeled
+                        : (result->nrows   > 0 ? result->nrows    : result->ndata);
 
     *accuracy = result->ncorrect >= 0 ? double(result->ncorrect) / double(ndata) : NAN;
 
@@ -1280,10 +1301,19 @@ void ggml_opt_epoch_callback_progress_bar(
     const int64_t t_eta_m = t_eta_s / 60;
     t_eta_s -= t_eta_m * 60;
 
+    // Build 27: average throughput of this pass (tokens = micro-batches * physical batch).
+    // Useful to compare configurations without waiting for the ETA to converge.
+    const int64_t t_tokens = ibatch * n_ubatch;
+    const double  t_tokens_per_s = (t_ibatch_us > 0 && t_tokens > 0)
+                                 ? (double) t_tokens * 1e6 / (double) t_ibatch_us
+                                 : 0.0;
+
     fprintf(stderr, "] data=%07" PRId64 "/%07" PRId64 " %s %s "
-            "t=%02" PRId64 ":%02" PRId64 ":%02" PRId64 " ETA=%02" PRId64 ":%02" PRId64 ":%02" PRId64 " \r",
+            "t=%02" PRId64 ":%02" PRId64 ":%02" PRId64 " ETA=%02" PRId64 ":%02" PRId64 ":%02" PRId64 " "
+            "%5.1f tok/s \r",
             idata, idata_max, loss_str, acc_str,
-            t_ibatch_h, t_ibatch_m, t_ibatch_s, t_eta_h, t_eta_m, t_eta_s);
+            t_ibatch_h, t_ibatch_m, t_ibatch_s, t_eta_h, t_eta_m, t_eta_s,
+            t_tokens_per_s);
     if (ibatch == ibatch_max) {
         fprintf(stderr, "\n");
     }

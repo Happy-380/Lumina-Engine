@@ -69,7 +69,7 @@ cmake --build build-release -j 12
 | `GGML_NATIVE=OFF` | 不针对本机优化，保证多变体 |
 | `BUILD_SHARED_LIBS=ON` | `GGML_BACKEND_DL` 的前提 |
 | `GGML_RPC=ON` | 生成 `ggml-rpc.dll` / `ggml-rpc-server.exe` |
-| `GGML_VULKAN=ON` | 生成 `ggml-vulkan.dll`；`configure-release.bat` 检测到 `D:\VulkanSDK\sdk\Bin\glslc.exe` 时自动启用，否则回退 CPU-only |
+| `GGML_VULKAN=ON` | 生成 `ggml-vulkan.dll`；`configure-release.bat` 与 `configure-clang.bat` 都会在检测到 `D:\VulkanSDK\sdk\Bin\glslc.exe` 时自动启用（并设置 `VULKAN_SDK` / `CMAKE_PREFIX_PATH`），否则回退 CPU-only |
 
 > Build 12 起默认交付带 Vulkan 后端。本机 Vulkan SDK 由 LunarG 安装包的 7z 载荷解包到
 > `D:\VulkanSDK\sdk`（无需管理员权限）。运行时仅需系统自带的 `vulkan-1.dll`。
@@ -119,10 +119,10 @@ Clang 会额外构建 `ivybridge/piledriver/cooperlake/zen4/sapphirerapids`，
 MSVC 对分块内核的代码生成略优（+11% vs Clang），Clang 才能构建全部 14 个变体。
 因此交付时把两者合并：
 
-仓库根目录提供了一键脚本，默认组装到 `C:\Lumina-Engine\Lumina-Engine-Bin`：
+仓库根目录提供了一键脚本，默认组装到 `D:\Lumina-Engine\Lumina-Engine-Bin`：
 
 ```bat
-C:\Lumina-Engine\build-bin.bat
+D:\Lumina-Engine\build-bin.bat
 ```
 
 它等价于：
@@ -143,9 +143,12 @@ copy C:\Windows\System32\vcruntime140.dll      ..\Lumina-Engine-Bin\
 copy C:\Windows\System32\vcruntime140_1.dll    ..\Lumina-Engine-Bin\
 ```
 
-> 上表为等价示意；**实际脚本为 `bench\assemble_bin.bat`**：它会先删除并重建 `Lumina-Engine-Bin`，
-> 用 clang 全量铺底、9 个 MSVC 变体覆盖，并从 `%SystemRoot%\System32` 拷贝 5 个运行库
-> （不再回退到任何旧交付目录）。详见 [Delivery](Delivery.md)。
+> **Build 31 起：clang 构建直接把最终二进制链接进 `Lumina-Engine-Bin`**（`configure-clang.bat` 用
+> `-DCMAKE_RUNTIME_OUTPUT_DIRECTORY` / `-DCMAKE_LIBRARY_OUTPUT_DIRECTORY` 指向交付目录），
+> 因此不再有 `build-clang\bin` 这份重复副本。`bench\assemble_bin.bat` 只做两件事：
+> 用 9 个 MSVC 变体覆盖 clang 基底、从 `%SystemRoot%\System32` 拷贝 5 个运行库
+> （不再删除/重建交付目录；没有 clang 构建时才回退到 MSVC 基底 + 备份变体）。
+> 详见 [Delivery](Delivery.md)。
 >
 > CPU 后端 DLL 是独立模块、走 C ABI，已验证 MSVC 与 Clang 构建的 CPU 后端可以
 > 与另一编译器构建的 `ggml-base.dll` / 工具混用。
@@ -155,7 +158,7 @@ copy C:\Windows\System32\vcruntime140_1.dll    ..\Lumina-Engine-Bin\
 ## 6. 产物布局
 
 ```
-build-*/bin/
+Lumina-Engine-Bin/          # Build 31 起也是 clang 构建的输出目录
 ├─ ggml-base.dll          # 张量/内存/图
 ├─ ggml.dll               # 调度
 ├─ ggml-rpc.dll           # RPC 后端
@@ -167,8 +170,9 @@ build-*/bin/
 └─ *-impl.dll             # 各工具的伴随库
 ```
 
-`Lumina-Engine-Bin/`（即仓库根目录下、与源码目录同级）为最终的 53 文件交付集（含 14 个 CPU 变体 + 运行库），
-也是**唯一的交付目录**；上面的 `build-*/bin/` 只是构建中间产物。旧入口 `C:\Lumina-Engine\llama` 已删除。
+`Lumina-Engine-Bin/`（即仓库根目录下、与源码目录同级）为最终的 **55 文件**交付集（含 14 个 CPU 变体 + `ggml-vulkan.dll` + 运行库），
+也是**唯一的交付目录**。clang 构建直接写入这里；只有 MSVC 树保留自己的
+`build-release\bin`（它是 9 个 MSVC 变体的产地，也是“没有 clang 时”的回退基底）。旧入口 `D:\Lumina-Engine\llama` 已删除。
 也可直接调用 `bench\assemble_bin.bat` 只做组装。详见 [Delivery](Delivery.md)。
 
 ---

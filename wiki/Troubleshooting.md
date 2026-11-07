@@ -130,6 +130,27 @@ pp512 时 Q8_128 scratch 约 6.4 MB，可忽略。二值查表（默认启用）
 
 ---
 
+## 对话 / CLI
+
+### Q: MoE 模型对话时，第二轮及之后只回 `None`？
+
+Build 30 已修。根因：CLI 把每轮 assistant 回复追加进历史时未检查是否为空；只要某一轮没有可见输出
+（首 token 即 EOS、流被中断、content 解析为空、请求报错），「空 assistant 轮」就会永久留在历史里，
+下一轮请求变成 `[user, assistant(""), user]`，严格 chat template 的 MoE 模型从这轮起每轮只输出占位串。
+Build 30 起：空回复/失败的轮次不入历史（打印 `[empty response: nothing was added to the chat history]`）。
+若仍在旧版上复现，先 `/clear` 清空历史即可恢复。
+
+### Q: `echo "..." | Lumina-Engine-cli.exe` 或关掉输入管道后进程不退出、一直刷 `> `？
+
+Build 30 已修（空读取 = EOF → 退出，与上游 llama.cpp #29722 一致）。旧版在 stdin 关闭后会无限循环，
+只能 Ctrl+C 或 kill。
+
+### Q: 模型的推理过程没有闭合的 `[End thinking]`？
+
+Build 30 起每轮结束都会补 `[End thinking]`（含流中断/报错）；旧版只有「推理 → 正文」的转折才会闭合。
+
+---
+
 ## 采样
 
 推荐参数（与模型发布方一致）：

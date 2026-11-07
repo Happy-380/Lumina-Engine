@@ -1,14 +1,21 @@
 @echo off
 REM ---------------------------------------------------------------------------
-REM Assemble the Lumina-Engine runtime into the default delivery directory:
-REM     <repo root>\Lumina-Engine-Bin      (i.e. C:\Lumina-Engine\Lumina-Engine-Bin)
+REM Finalise the Lumina-Engine runtime directory <repo root>\Lumina-Engine-Bin.
 REM
-REM Layout: when a clang build is available it is used as the base (tools + all
-REM 14 ggml-cpu variants) and the 9 MSVC variants overwrite their clang
-REM counterparts. When clang is not installed, the MSVC build is used as the base
-REM and the 5 clang-only CPU variants are restored from bench\clang_variants_backup
-REM so the delivery still ships the full 14-variant set. The five runtime
-REM redistributables are copied from the system.
+REM Since Build 31 the Clang build links *directly* into Lumina-Engine-Bin
+REM (-DCMAKE_RUNTIME_OUTPUT_DIRECTORY/-DCMAKE_LIBRARY_OUTPUT_DIRECTORY in
+REM configure-clang.bat), so there is no duplicated <build-clang>\bin anymore.
+REM
+REM This script therefore only does the two things a plain build cannot:
+REM   1. overlay the 9 MSVC-compiled CPU variants (build-release\bin) on top of
+REM      the clang baseline -- on Windows MSVC stays the default toolchain, and
+REM      the 5 remaining clang-only variants (ivybridge, piledriver, cooperlake,
+REM      zen4, sapphirerapids) cannot be built with MSVC at all;
+REM   2. copy the 5 runtime redistributables from System32.
+REM
+REM Fallback: when no clang build is available (clang not installed / build tree
+REM removed) the whole MSVC bin becomes the base and the 5 clang-only variants
+REM are restored from bench\clang_variants_backup.
 REM ---------------------------------------------------------------------------
 setlocal EnableExtensions
 set "ROOT=%~dp0.."
@@ -20,25 +27,29 @@ if not exist "%SRC_MSVC%" (
     echo [assemble_bin] missing msvc build: "%SRC_MSVC%"
     exit /b 1
 )
+if not exist "%DST%" mkdir "%DST%"
 
-set "SRC_BASE=%SRC_CLANG%"
-set "HAVE_CLANG=1"
-if not exist "%SRC_CLANG%" (
-    echo [assemble_bin] warning: clang build not found, using the MSVC build as base
-    set "SRC_BASE=%SRC_MSVC%"
-    set "HAVE_CLANG=0"
+REM Has the clang build already produced the delivery baseline in %DST%?
+set "HAVE_CLANG_DST=0"
+if exist "%DST%\Lumina-Engine-cli.exe" if exist "%DST%\ggml-base.dll" set "HAVE_CLANG_DST=1"
+
+REM Legacy layout (clang build tree still emitting into build-clang\bin)
+if "%HAVE_CLANG_DST%"=="0" if exist "%SRC_CLANG%\Lumina-Engine-cli.exe" (
+    echo [assemble_bin] using the legacy staging directory "%SRC_CLANG%"
+    xcopy /y /q /i "%SRC_CLANG%\*" "%DST%\" >nul
+    set "HAVE_CLANG_DST=1"
 )
 
-if exist "%DST%" rd /s /q "%DST%"
-mkdir "%DST%"
-
-xcopy /y /q /i "%SRC_BASE%\*" "%DST%\" >nul
+if "%HAVE_CLANG_DST%"=="0" (
+    echo [assemble_bin] warning: no clang build found, using the MSVC build as the base
+    xcopy /y /q /i "%SRC_MSVC%\*" "%DST%\" >nul
+)
 
 for %%v in (x64 sse42 sandybridge haswell skylakex cannonlake cascadelake icelake alderlake) do (
     copy /y "%SRC_MSVC%\ggml-cpu-%%v.dll" "%DST%\" >nul
 )
 
-if "%HAVE_CLANG%"=="0" (
+if "%HAVE_CLANG_DST%"=="0" (
     for %%v in (ivybridge piledriver cooperlake zen4 sapphirerapids) do (
         if exist "%~dp0clang_variants_backup\ggml-cpu-%%v.dll" (
             copy /y "%~dp0clang_variants_backup\ggml-cpu-%%v.dll" "%DST%\" >nul
@@ -55,6 +66,9 @@ for %%f in (libomp140.x86_64.dll msvcp140.dll vcomp140.dll vcruntime140.dll vcru
         echo [assemble_bin] warning: %%f not found in System32
     )
 )
+
+REM vulkan-shaders-gen is a build-time host tool (it needs the Vulkan SDK), never ship it
+if exist "%DST%\vulkan-shaders-gen.exe" del /q "%DST%\vulkan-shaders-gen.exe"
 
 set /a COUNT=0
 for %%f in ("%DST%\*") do set /a COUNT+=1

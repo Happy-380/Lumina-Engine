@@ -4,7 +4,7 @@
 
 > 基于 llama.cpp b-10991 的 Windows x86-64 推理 / 压缩 / 训练引擎：为 **Bonsai Q1_0** 提供专用 CPU 内核，同时提供面向更多模型的 **Vulkan 加速、自动设备策略、无损压缩与 QLoRA 训练**。
 
-![Build](https://img.shields.io/badge/build-26-blue)
+![Build](https://img.shields.io/badge/build-31-blue)
 ![llama.cpp](https://img.shields.io/badge/llama.cpp-b10991-green)
 ![Platform](https://img.shields.io/badge/platform-Windows%20x86--64-lightgrey)
 ![License](https://img.shields.io/badge/license-AGPL--3.0-orange)
@@ -82,7 +82,7 @@ Bonsai-8B 的全部权重都是 1-bit（`Q1_0`，128 个权重共享一个 fp16 
 - **一套包，14 种 CPU**：SSE4.2 / Sandy Bridge / Haswell / Skylake-X / Ice Lake / Alder Lake / Zen 4 / Sapphire Rapids……运行时按 CPUID 自动选择。
 - **CPU / GPU 自动决策**：无 GPU 走纯 CPU；集显做算子 offload；独显按显存整层 offload；MoE 模型自动避免"越 offload 越慢"。
 - **模型无损压缩**：`.gguf.lumina` 容器把 Q4_K / Q6_K 的 `d/dmin/scales` 与权重流分开排列后再 DEFLATE（F32 张量单独压缩）。以 `SmallThinker-4BA0.6B-Instruct.Q4_K_M.gguf` 为例，2.63 GB → 2.48 GB（**94.28%**），解压后 SHA-256 与原始文件逐字节一致。
-- **内置训练引擎**：`Lumina-Engine-train` 直接对 Q4_K / Q8_0 / Q1_0 量化模型做 **QLoRA**，支持 JSONL 数据集、检查点、断点续训、MoE 专家适配器，以及 8 GB 机器上的 32K 长上下文训练（注意力反向现场重算 + 数据集 mmap，内存稳定约 3.5 GiB）。
+- **内置训练引擎**：`Lumina-Engine-train` 直接对 Q4_K / Q8_0 / Q1_0 量化模型做 **QLoRA**，支持 JSONL 数据集、检查点、断点续训、MoE 专家适配器，以及 8 GB 机器上的长上下文训练（注意力反向现场重算 + 数据集 mmap，`-c 8192` 约 3.5 GiB；`-c 32768` 实测约 4.0 GiB，属于 8 GB 的贴边场景，详见 `HANDOFF.md` Build 30）。
 - **一条命令交付**：`build-bin.bat` 依次编译 MSVC + Clang 双树并组装运行目录，不需要手工拷贝 DLL。
 
 ---
@@ -108,7 +108,7 @@ Bonsai-8B 的全部权重都是 1-bit（`Q1_0`，128 个权重共享一个 fp16 
 | phi-3-mini Q4_K_M + 集显算子 offload | pp256 **约 1.6×**（76 vs 48 t/s） |
 | Qwen3-0.6B 自动设备策略 | PPL 23.7397 vs 纯 CPU 23.7639，**约 1.9×** 加速 |
 | 量化模型 QLoRA | SmallThinker MoE loss **1.93 → 1.44**；Qwen2.5-0.5B **2.55 → 1.99** |
-| 32K 长上下文训练（8 GB 机器） | 私有内存稳定 **~3.5 GiB**，无磁盘交换，loss 逐位一致 |
+| 长上下文训练（8 GB 机器） | `-c 8192` 私有内存 **~3.5 GiB**、无磁盘交换；`-c 32768` 实测 **~4.0 GiB**（可用物理内存 ~0.9 GiB，`--resume` 的 KV 重放较慢） |
 
 > 通用优化数据来自 i5-12500H / Intel Iris Xe（Vulkan）测试机，Q1_0 数据来自 i5-10400；以上能力不依赖 Q1_0，Q1_0 专用内核仍然只在 Q1_0 + AVX2 路径生效。
 
@@ -128,7 +128,7 @@ Bonsai-8B 的全部权重都是 1-bit（`Q1_0`，128 个权重共享一个 fp16 
 
 ### 方式一：直接使用预编译产物（推荐）
 
-`Lumina-Engine-Bin/` 已包含 14 个 CPU 变体、全部工具和运行库（54 个文件）。把模型放到仓库根目录，然后：
+`Lumina-Engine-Bin/` 已包含 14 个 CPU 变体、全部工具和运行库（55 个文件，含 Vulkan 后端）。把模型放到仓库根目录，然后：
 
 ```bat
 cd /d C:\Lumina-Engine\Lumina-Engine-Bin
@@ -137,12 +137,15 @@ REM 单轮推理
 Lumina-Engine-cli.exe -m ..\Bonsai-8B.gguf -p "The capital of France is" -n 32 -st -t 6
 ```
 
-预期输出：
+预期输出（Build 24 起 CLI 改为 HTTP 客户端形态，性能行由 `[ Prompt / Generation ]` 给出）：
 
 ```text
-The capital of France is Paris.
-...
-llama_perf_context_print:        eval time = ...
+> The capital of France is
+The capital of France is **Paris**
+
+[ Prompt: 15.4 t/s | Generation: 19.9 t/s ]
+
+Exiting...
 ```
 
 交互式对话（不带 `-p` 即进入多轮模式）：
@@ -271,7 +274,7 @@ Lumina-Engine-cli.exe -m ..\Bonsai-8B.gguf --lora out\stage2.lora.gguf -p "你�
 - 支持**稠密与 MoE** 模型（含 3D 专家适配器、router）。
 - 在已有适配器上继续训练用 `--init-lora`；断点续训用 `--resume`；检查点由 `--save-steps` / `--save-every-epochs` / `--keep-last` 管理。
 - `--cpu-cores 0`（默认）使用**全部逻辑核**，比只用物理核约快 **1.3×**，loss 逐位一致。
-- 长上下文训练在 8 GB 机器上也能跑 `-c 32768`（注意力反向现场重算 + 数据集 mmap）。
+- 长上下文训练在 8 GB 机器上也能跑：`-c 8192` 很稳，`-c 32768` 需要留足内存（注意力反向现场重算 + 数据集 mmap；实测 RSS ~4.0 GiB）。
 
 三阶段完整流程见 **[TRAINING_PIPELINE.md](TRAINING_PIPELINE.md)**，参数与实现见 **[wiki/Training.md](wiki/Training.md)**。
 
@@ -379,7 +382,7 @@ cmake -S llama.cpp-b10991 -B build-release -G Ninja ^
 cmake --build build-release -j
 ```
 
-编译完成后用 `bench\assemble_bin.bat` 组装到 `Lumina-Engine-Bin\`（需要 `build-clang\bin` 作为基底；没有 Clang 构建时使用 MSVC 基底 + 备份变体）。
+Build 31 起 Clang 构建直接把二进制写进 `Lumina-Engine-Bin\`（`configure-clang.bat` 里的 `-DCMAKE_RUNTIME_OUTPUT_DIRECTORY`），`bench\assemble_bin.bat` 只负责用 9 个 MSVC 变体覆盖 + 拷贝 5 个运行库；没有 Clang 构建时才回退到 MSVC 基底 + 备份变体。
 
 > 构建时若检测到 `D:\VulkanSDK\sdk` 会自动启用 Vulkan，未安装则自动回退 CPU-only。
 
@@ -434,7 +437,7 @@ Lumina-Engine/
 │  ├─ ggml/src/ggml-cpu/q1t.cpp      # Q1_0 分块 GEMM + 单列 GEMV + Q1LUT
 │  ├─ src/lumina-gguf.cpp            # .gguf.lumina 无损容器解码器
 │  └─ tools/lumina-train/            # C++ QLoRA 训练引擎
-├─ Lumina-Engine-Bin/         # ★ 预编译交付产物（54 文件 / 14 变体）
+├─ Lumina-Engine-Bin/         # ★ 预编译交付产物（55 文件 / 14 变体 + ggml-vulkan.dll）
 ├─ bench/                     # 内核微基准 + 构建 / 组装脚本
 ├─ tools/                     # GGUF 压缩、解包、查看脚本
 ├─ wiki/                      # 中英文详细文档
@@ -450,7 +453,9 @@ Lumina-Engine/
 ## FAQ
 
 **Q：一定要有 GPU 吗？**
-不需要。默认就是纯 CPU 路径；Vulkan 只是可选加速，没有 Vulkan 设备会自动回退。
+不需要。交付包同时带 CPU（14 个变体）与 Vulkan 后端，**同一个 exe 会自动选择**：
+无 GPU → 纯 CPU；只有集显 → 层留 CPU（+可选算子 offload）；有独显 → 自动按 VRAM offload。
+显式 `-ngl` 随时覆盖自动策略。详见 `HANDOFF.md` § Build 31.4.1。
 
 **Q：支持 NVIDIA CUDA 吗？**
 当前预编译产物为 **CPU + Vulkan**。需要 CUDA 请基于上游 llama.cpp 自行构建；Q1_0 专用 CPU 内核是 x86 路径，另有 Vulkan Q1_0 路径。
@@ -482,6 +487,13 @@ Lumina-Engine/
 
 | Build | 主要内容 |
 |------:|----------|
+| **31** | CPU 解码提速：repack 后的 Q4_K GEMV 内核加软件预取，纯 CPU 单 token 生成 **+13%**（输出逐位不变）；新增可复现的内核级 A/B 基准 `tests/bench-cpu-kern.cpp` |
+| 30 | CLI 多轮对话修复：空回复不再写入历史（MoE 从第二轮起只回 `None` 的根因）；stdin 关闭 / EOF 时退出而不是死循环；每轮闭合 `[End thinking]` |
+| 29 | `--mask-history` 训练路径损坏定位（训练改用 `--no-mask-history`）+ loss/accuracy 归一化口径显式化 |
+| 28 | 长上下文训练可行性确认；loss 显示口径说明（累计均值） |
+| 27 | 数据集改为边解析边落盘（加载峰值内存 O(1)），进度条加 `tok/s` |
+| 26 | 修复训练梯度累加器从不清零（loss 线性攀升的关键正确性问题） |
+| 25 | Qwen3.5（qwen35 混合线性注意力）QLoRA 训练支持 |
 | **24** | 所有控制台工具统一启动画面（ASCII logo + Build 号 + 项目链接） |
 | 23 | 训练默认用满全部逻辑核，约 **1.3×** 提速，loss 逐位一致 |
 | 22 | 修复 `--resume` 后 ETA 持续上涨；新增 `--dataset-stride`，epoch 时间可再减半 |

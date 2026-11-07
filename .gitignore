@@ -1,0 +1,137 @@
+# ---------------------------------------------------------------------------
+# Lumina-Engine 仓库根 .gitignore
+#
+# 规则说明：.gitignore 里的路径**只能是相对路径**（相对于本文件所在目录），
+# 不支持 `C:\...` 这种绝对路径；以 `/` 开头的规则表示“只匹配仓库根目录下的该路径”。
+# 本文件里所有规则都相对仓库根（C:\Lumina-Engine）。
+#
+# 目的：把所有“编译产物 / 生成物”挡在版本库之外，同时保留构建脚本依赖的少数
+# 预编译变体（见文件末尾的例外说明）。
+# ---------------------------------------------------------------------------
+
+# ===== 1. 交付目录（纯二进制） =============================================
+# Lumina-Engine-Bin 现在既是交付目录，也是 clang 构建的输出目录（Build 31 起），
+# 里面全部是 exe/dll/运行库，可随时用 build-bin.bat 重建。
+/Lumina-Engine-Bin/
+
+# ===== 2. CMake / Ninja 构建树 =============================================
+/llama.cpp-b10991/build*/
+/llama.cpp-b10991/build-*/
+/llama.cpp-b10991/vulkan-port/build*/
+/build/
+/build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+CTestTestfile.cmake
+compile_commands.json
+build.ninja
+rules.ninja
+.ninja_deps
+.ninja_log
+build.ninja.stamp
+CMakeUserPresets.json
+install_manifest.txt
+Testing/
+*.cmake.stamp
+
+# 注意：不要忽略 `Makefile` —— llama.cpp-b10991/Makefile 是上游源码的一部分。
+/llama.cpp-b10991/Release/
+/llama.cpp-b10991/Debug/
+
+# ===== 3. 编译器产物 =======================================================
+*.obj
+*.o
+*.lo
+*.a
+*.lib
+*.exp
+*.ilk
+*.pdb
+*.idb
+*.sbr
+*.res
+*.tlog
+*.ipdb
+*.iobj
+*.gcno
+*.gcda
+*.profraw
+*.profdata
+*.dSYM/
+*.su
+*.gch
+*.pch
+
+# ===== 4. 可执行文件 / 动态库 ==============================================
+# 交付物只有 exe/dll，源码树里不应出现；保留 bench/clang_variants_backup 的例外（见 9）
+*.exe
+*.dll
+*.so
+*.so.*
+*.dylib
+*.sys
+*.com
+
+# ===== 5. 构建工具 / 运行期临时文件 ========================================
+# 由 ggml-vulkan 的 ExternalProject 生成的 host 工具
+host-toolchain.cmake
+/vulkan-shaders-gen.exe
+
+# 训练期临时数据流（%TEMP%\lumina-train\<tag>-<pid>\，一般不在仓库内，防止误入）
+*.stream.bin
+*.tmp
+
+# ===== 6. 生成物 / 归档 =====================================================
+# Kaggle 源码包由 kaggle/tools/pack_source.py 生成（10 MB），不要进版本库；
+# 需要随包发布时再手动 `git add -f`。
+/kaggle/src/*.zip
+# notebook 由 kaggle/tools/make_notebook.py 生成；如需纳入版本管理，删掉下一行
+#/kaggle/Lumina-Engine-Kaggle-Train.ipynb
+
+# Python 缓存
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ===== 7. 模型权重 / 大文件 =================================================
+# 只忽略大模型权重；保留上游的测试词表（test-tokenizer 需要它们）。
+*.gguf
+*.ggml
+*.safetensors
+*.bin
+!llama.cpp-b10991/models/ggml-vocab-*.gguf
+
+# ===== 8. 编辑器 / 系统 / 工具目录 =========================================
+.vs/
+.vscode/
+.idea/
+.cache/
+.ccache/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+# pi 代理的本地会话状态
+/llama.cpp-b10991/.pi/
+# 视频工程（hyperframes）的第三方依赖与临时产物
+/video/node_modules/
+/video/.cache/
+/video/.thumbnails/
+/video/renders/*.meta.json
+
+# ===== 9. 例外：必须纳入版本库的二进制 =====================================
+# bench/clang_variants_backup 里的 5 个 clang 专属 CPU 变体 DLL 是
+# assemble_bin.bat 的“本机没有 clang”回退依赖，属于有意提交的预编译件。
+!bench/clang_variants_backup/*.dll
+
+# ===== 10. 内部文档（不入公开仓库） ========================================
+# 交接 / 优化日志 / Kaggle 实测 / 训练流程：只在本地维护。
+# 开头的 `/` 保证只匹配仓库根目录下的同名文件。
+/HANDOFF.md
+/KAGGLE_TEST.md
+/OPTIMIZATION_LOG.md
+/TRAINING_PIPELINE.md

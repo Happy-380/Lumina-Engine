@@ -235,7 +235,7 @@ Conclusion: tg and pp (`ne11>=8`) use Q1LUT by default, while pp (`2..7`) uses t
 ## 9. Reproduction commands
 
 ```bat
-cd C:\Lumina-Engine\Lumina-Engine-Bin
+cd D:\Lumina-Engine\Lumina-Engine-Bin
 
 REM Binary LUT A/B (on by default; disable with GGML_Q1_LUT=0)
 set GGML_Q1_LUT=0
@@ -263,4 +263,80 @@ set GGML_Q1_GEMV_ROWS=
 
 REM Perplexity
 Lumina-Engine-perplexity.exe -m ..\Bonsai-8B.gguf -f ..\docx\whitepaper.txt -c 512 -t 6 --chunks 4
+```
+
+---
+
+## 10. Whole-block prefetch in the Q4_K GEMV (Build 31)
+
+Every other section of this page is about **Q1_0 (Bonsai 1-bit)** kernels. Build 31 targets a different
+line: the CPU decode kernel of **Q4_K / Q4_K_M models**, `ggml_gemv_q4_K_8x8_q8_K()` (the repacked
+kernel), which is the real bottleneck of single-token generation for ordinary GGUF models on CPU.
+
+### 10.1 Diagnosis
+
+| measurement (single thread) | result |
+|---|---:|
+| kernel sweeping an 18 MiB matrix (DRAM resident) | 6.00-6.47 GB/s |
+| plain streaming read on the same thread (32 MiB) | 11.6-13.1 GB/s |
+| kernel sweeping a 0.56 MiB matrix (L3 resident) | ~10.1 GB/s |
+
+The kernel only reaches 55-65% of the streaming ceiling, while it hits 10 GB/s when L3 resident - so the
+bottleneck is **memory latency** (the eight loads of one 1152 B `block_q4_Kx8` wait for the arithmetic of
+the previous block), not bandwidth and not compute.
+
+### 10.2 Approach and sweep
+
+At the top of the block loop, pull the whole block **N iterations ahead** (18 cache lines) into L1.
+Sweep over N plus two variants (only the head of the block / with a bounds check):
+
+| variant | median | best 25% | vs unmodified |
+|---|---:|---:|---:|
+| unmodified (baseline copy) | 6.00-6.47 GB/s | 6.45-7.12 | - |
+| **whole block +1** | 6.56-7.37 | 7.29-8.17 | +7..+19% |
+| **whole block +2 (adopted)** | 6.34-7.72 | 7.03-8.45 | **+10..+19%** |
+| whole block +4 | 6.37-7.15 | 6.98-7.92 | +7..+14% |
+| whole block +2 **with `if (b+2<nb)`** | 5.49-5.73 | 5.89-6.44 | **-4..-15%** |
+| head only +2 | 4.78-5.63 | 5.35-6.16 | -14..-28% |
+
+> Each "measurement" is an interleaved A/B inside one process (a training job was running in the
+> background, so absolute bandwidth drifts by +-20% while in-process ratios stay stable). Re-test of the
+> final version: baseline 5.87 -> 6.63 GB/s (**+13.0%**).
+
+### 10.3 End to end
+
+`Qwen3.5-0.8B-Q4_K_M.gguf` (506 MiB, Q4_K_M), `llama-bench -t 4 -p 16 -n 32`:
+
+| configuration | decode tg32 (runs, median in bold) | gain |
+|---|---|---:|
+| Clang build, before | 13.40 13.45 13.54 13.78 14.12 14.49 (**13.66**) | - |
+| Clang build, after | 13.72 15.28 15.49 15.53 16.31 16.74 (**15.53**) | **+13.7%** |
+| MSVC delivery variant, before | 5.82 6.26 7.70 7.86 8.24 9.16 9.82 (**7.86**) | - |
+| MSVC delivery variant, after | 4.85 6.60 6.72 8.64 9.28 10.68 13.65 (**8.64**) | paired median **+13%** |
+
+Prefill `pp128` before 79.15 / 86.05 / 87.59 / 89.04, after 87.42 / 87.60 / 89.08 / 89.46 (the GEMM
+path is untouched, as expected); the L3 resident small matrix neither gains nor loses (10.07 -> 10.30
+GB/s, within noise).
+
+### 10.4 Correctness
+
+| check | result |
+|---|---|
+| 7 variants vs an independent scalar reference (per column dequant + dot, double accumulation) | `max_abs_err = 4.8e-07` (\|ref\|max ~ 3.5, tolerance 2.9e-06), all OK |
+| patched kernel vs previous kernel | **bit-identical** (`memcmp`) |
+| real engine greedy decoding (`--temp 0 --seed 1234 -n 48`) | Build 30 and Build 31 produce exactly the same text |
+
+### 10.5 Reproduce
+
+```bat
+REM builds only the separate benchmark tree (does not touch the delivery trees), ~2-3 min
+bench\build_bench_cpu_kern.bat
+
+cd llama.cpp-b10991\build-bench
+REM correctness only
+bin\bench-cpu-kern.exe --n 1024 --nc 4096 --check-only
+REM DRAM-resident A/B (18 MiB matrix)
+bin\bench-cpu-kern.exe --n 2048 --nc 16384 --iters 120 --rounds 24
+REM L3-resident A/B (0.56 MiB matrix)
+bin\bench-cpu-kern.exe --n 1024 --nc 1024 --iters 2000 --rounds 14
 ```

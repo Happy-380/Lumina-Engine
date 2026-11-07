@@ -10,7 +10,7 @@ if exist "D:\VulkanSDK\sdk\Bin\glslc.exe" (
   echo [configure-release] warning: Vulkan SDK not found, building without Vulkan
   set "GGML_VULKAN_OPT=-DGGML_VULKAN=OFF"
 )
-cd /d C:\Lumina-Engine\llama.cpp-b10991
+cd /d "%~dp0llama.cpp-b10991"
 cmake -S . -B build-release -G Ninja ^
   -DCMAKE_BUILD_TYPE=Release ^
   -DBUILD_SHARED_LIBS=ON ^

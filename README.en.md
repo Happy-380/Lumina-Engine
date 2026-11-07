@@ -4,7 +4,7 @@
 
 > A Windows x86-64 inference / compression / training engine built on llama.cpp b-10991: dedicated CPU kernels for **Bonsai Q1_0**, plus **Vulkan acceleration, automatic device policy, lossless compression, and QLoRA training** for a wider range of models.
 
-![Build](https://img.shields.io/badge/build-26-blue)
+![Build](https://img.shields.io/badge/build-31-blue)
 ![llama.cpp](https://img.shields.io/badge/llama.cpp-b10991-green)
 ![Platform](https://img.shields.io/badge/platform-Windows%20x86--64-lightgrey)
 ![License](https://img.shields.io/badge/license-AGPL--3.0-orange)
@@ -82,7 +82,7 @@ The upstream generic Q1_0 kernel converts to float every 32 weights and does not
 - **One package, 14 CPUs**: SSE4.2 / Sandy Bridge / Haswell / Skylake-X / Ice Lake / Alder Lake / Zen 4 / Sapphire Rapids… selected automatically via CPUID at runtime.
 - **Automatic CPU / GPU decisions**: pure CPU without a GPU; operator offload on integrated GPUs; full-layer offload on discrete GPUs; MoE models automatically avoid the "more offload, slower" trap.
 - **Lossless model compression**: the `.gguf.lumina` container separates the `d/dmin/scales` fields of Q4_K / Q6_K from the weight streams and then applies DEFLATE (F32 tensors are compressed separately). For `SmallThinker-4BA0.6B-Instruct.Q4_K_M.gguf`, 2.63 GB → 2.48 GB (**94.28%**), with a byte-identical SHA-256 after decompression.
-- **Built-in training engine**: `Lumina-Engine-train` performs **QLoRA** directly on Q4_K / Q8_0 / Q1_0 quantized models, with JSONL datasets, checkpoints, resume, MoE expert adapters, and 32K long-context training on an 8 GB machine (attention recomputation during backward + dataset mmap; stable at ~3.5 GiB).
+- **Built-in training engine**: `Lumina-Engine-train` performs **QLoRA** directly on Q4_K / Q8_0 / Q1_0 quantized models, with JSONL datasets, checkpoints, resume, MoE expert adapters, and long-context training on an 8 GB machine (attention recomputation during backward + dataset mmap; ~3.5 GiB at `-c 8192`, ~4.0 GiB at `-c 32768`, which is tight for 8 GB - see `HANDOFF.md` Build 30).
 - **One-command delivery**: `build-bin.bat` builds the MSVC + Clang trees and assembles the runtime directory; no manual DLL copying.
 
 ---
@@ -108,7 +108,7 @@ Not every change is 1-bit-only: the Q1_0 kernels are strictly isolated, while th
 | phi-3-mini Q4_K_M + iGPU operator offload | pp256 **~1.6×** (76 vs 48 t/s) |
 | Qwen3-0.6B automatic device policy | PPL 23.7397 vs 23.7639 pure CPU, **~1.9×** faster |
 | QLoRA on quantized models | SmallThinker MoE loss **1.93 → 1.44**; Qwen2.5-0.5B **2.55 → 1.99** |
-| 32K long-context training (8 GB machine) | Private memory stable at **~3.5 GiB**, no swapping, bit-identical loss |
+| Long-context training (8 GB machine) | `-c 8192`: private memory **~3.5 GiB**, no swapping; `-c 32768`: measured **~4.0 GiB** (~0.9 GiB free physical RAM, slow KV replay on `--resume`) |
 
 > General-optimization data comes from an i5-12500H / Intel Iris Xe (Vulkan) machine; Q1_0 data comes from an i5-10400. None of these capabilities depend on Q1_0, and the Q1_0-specific kernels still only affect the Q1_0 + AVX2 path.
 
@@ -128,7 +128,7 @@ Not every change is 1-bit-only: the Q1_0 kernels are strictly isolated, while th
 
 ### Option 1: use the prebuilt binaries (recommended)
 
-`Lumina-Engine-Bin/` already contains 14 CPU variants, all tools, and the runtime libraries (54 files). Put the model in the repository root, then:
+`Lumina-Engine-Bin/` already contains 14 CPU variants, all tools, and the runtime libraries (55 files, including the Vulkan backend). Put the model in the repository root, then:
 
 ```bat
 cd /d C:\Lumina-Engine\Lumina-Engine-Bin
@@ -137,12 +137,16 @@ REM Single-turn inference
 Lumina-Engine-cli.exe -m ..\Bonsai-8B.gguf -p "The capital of France is" -n 32 -st -t 6
 ```
 
-Expected output:
+Expected output (since Build 24 the CLI is an HTTP client, so the perf line is
+`[ Prompt / Generation ]`):
 
 ```text
-The capital of France is Paris.
-...
-llama_perf_context_print:        eval time = ...
+> The capital of France is
+The capital of France is **Paris**
+
+[ Prompt: 15.4 t/s | Generation: 19.9 t/s ]
+
+Exiting...
 ```
 
 Interactive chat (omit `-p` to enter multi-turn mode):
@@ -271,7 +275,7 @@ Lumina-Engine-cli.exe -m ..\Bonsai-8B.gguf --lora out\stage2.lora.gguf -p "Hello
 - Supports **dense and MoE** models (including 3D expert adapters and the router).
 - Continue from an existing adapter with `--init-lora`; resume with `--resume`; manage checkpoints with `--save-steps` / `--save-every-epochs` / `--keep-last`.
 - `--cpu-cores 0` (default) uses **all logical cores**, about **1.3×** faster than physical cores alone, with bit-identical loss.
-- Long-context training runs at `-c 32768` even on 8 GB (attention recomputation during backward + dataset mmap).
+- Long-context training works on 8 GB: `-c 8192` is comfortable, `-c 32768` needs headroom (attention recomputation during backward + dataset mmap; measured RSS ~4.0 GiB).
 
 A typical three-stage chain is `base → stage1 (continued pretraining) → stage2 (instruction tuning, --init-lora stage1) → stage3 (persona, --init-lora stage2)`. Keep `-lora-rank` / `-lora-alpha` / `-lora-targets` identical across stages; the final adapter already contains the earlier stages.
 
@@ -381,7 +385,7 @@ cmake -S llama.cpp-b10991 -B build-release -G Ninja ^
 cmake --build build-release -j
 ```
 
-Then assemble into `Lumina-Engine-Bin\` with `bench\assemble_bin.bat` (it uses `build-clang\bin` as the base; without a Clang build it uses the MSVC base plus the backed-up variants).
+Since Build 31 the Clang build writes its binaries *directly* into `Lumina-Engine-Bin\` (see `-DCMAKE_RUNTIME_OUTPUT_DIRECTORY` in `configure-clang.bat`), so `bench\assemble_bin.bat` now only overlays the 9 MSVC CPU variants and copies the 5 runtime DLLs; without a Clang build it falls back to the MSVC base plus the backed-up variants.
 
 > If `D:\VulkanSDK\sdk` is detected, the build enables Vulkan automatically; otherwise it falls back to CPU-only.
 
@@ -436,7 +440,7 @@ Lumina-Engine/
 │  ├─ ggml/src/ggml-cpu/q1t.cpp      # Q1_0 tiled GEMM + single-column GEMV + Q1LUT
 │  ├─ src/lumina-gguf.cpp            # .gguf.lumina lossless container decoder
 │  └─ tools/lumina-train/            # C++ QLoRA training engine
-├─ Lumina-Engine-Bin/         # ★ Prebuilt delivery (54 files / 14 variants)
+├─ Lumina-Engine-Bin/         # ★ Prebuilt delivery (55 files / 14 variants + ggml-vulkan.dll)
 ├─ bench/                     # Kernel microbenchmarks + build / assemble scripts
 ├─ tools/                     # GGUF compression, unpacking, inspection scripts
 ├─ wiki/                      # Detailed docs in Chinese and English
@@ -453,7 +457,7 @@ Lumina-Engine/
 ## FAQ
 
 **Do I need a GPU?**
-No. The default is the pure-CPU path; Vulkan is optional acceleration, and the engine falls back automatically when no Vulkan device is present.
+No. The delivery ships both the CPU backend (14 variants) and the Vulkan backend, and **the same exe selects the right one automatically**: no GPU -> pure CPU; integrated GPU only -> layers stay on the CPU (+ optional operator offload); discrete GPU -> automatic VRAM-based offload. An explicit `-ngl` always overrides the policy. See `HANDOFF.md` section Build 31.4.1.
 
 **Is NVIDIA CUDA supported?**
 The prebuilt delivery is **CPU + Vulkan**. For CUDA, build on top of upstream llama.cpp yourself; the Q1_0-specific CPU kernels are x86 paths, and there is also a Vulkan Q1_0 path.
@@ -485,6 +489,13 @@ No. The Q1_0-specific kernels only affect 1-bit models; the 14 CPU variants, Vul
 
 | Build | Highlights |
 |------:|------------|
+| **31** | Faster CPU decoding: software prefetch in the repacked Q4_K GEMV kernel, **+13%** single-token generation on CPU (bit-identical output); added a reproducible kernel-level A/B benchmark (`tests/bench-cpu-kern.cpp`) |
+| 30 | CLI multi-turn fix: empty replies are no longer stored in the chat history (root cause of MoE models answering `None` from the 2nd turn on); exit on stdin EOF instead of spinning; `[End thinking]` is now closed every turn |
+| 29 | Located the broken `--mask-history` training path (use `--no-mask-history`); loss/accuracy normalisation made explicit |
+| 28 | Long-context training feasibility confirmed; clarified the loss reporting (cumulative average) |
+| 27 | Dataset is now streamed to disk while parsing (O(1) load RAM); progress bar gained `tok/s` |
+| 26 | Fixed the training gradient accumulators never being cleared (key correctness bug) |
+| 25 | Qwen3.5 (qwen35 hybrid linear attention) QLoRA training support |
 | **24** | Unified startup banner across all console tools (ASCII logo + build number + project links) |
 | 23 | Training uses all logical cores by default, ~**1.3×** faster with bit-identical loss |
 | 22 | Fixed ETA growing after `--resume`; added `--dataset-stride`, which can halve epoch time |

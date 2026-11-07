@@ -2,14 +2,113 @@
 
 > 🌐 [中文](Changes.md) | **English**
 
-This page lists all changes relative to upstream llama.cpp (b10991). The core changes touch **5
-files**: 2 new, 3 modified (the full binary lookup table Q1LUT lives inside the new `q1t.cpp`). All
-changes affect only the `GGML_TYPE_Q1_0` + AVX2 path; other models/quantizations/backends are
-unaffected.
+This page lists all changes relative to upstream llama.cpp (b10991). The Q1LUT (binary lookup
+table) work touches **5 files**: 2 new, 3 modified (all inside the new `q1t.cpp`), and affects
+only the `GGML_TYPE_Q1_0` + AVX2 path; on top of that there is the Q4_K decode-kernel prefetch
+(Build 31, see §0) plus the per-build CLI/training fixes.
 
 ---
 
-## 0. Training gradient-accumulator fix (Build 26)
+## 0. Q4_K GEMV software prefetch (Build 31)
+
+CPU single-token generation spends almost all of its time in `ggml_gemv_q4_K_8x8_q8_K` (the repacked
+Q4_K decode kernel). On this machine that kernel only reaches 6.0-7.5 GB/s per thread while a plain
+streaming read on the same thread tops out at 11.6-13.1 GB/s - so it is **memory-latency bound**, not
+bandwidth bound. Fix: at the top of the block loop, pull the whole block that will be consumed two
+iterations later (1152 B = 18 cache lines) into L1 with `_mm_prefetch`.
+**Do not add an `if (b + 2 < nb)` guard**: the branch inside the hot loop costs more than the few
+useless prefetches at the end (measured -13%), and `PREFETCHh` never faults on an invalid address.
+
+| File | Type | Description |
+|------|------|-------------|
+| `ggml/src/ggml-cpu/arch/x86/repack.cpp` | modified | `ggml_gemv_q4_K_8x8_q8_K()`: whole-block prefetch at +2 blocks (`sizeof` driven, unrolled) |
+| `CMakeLists.txt` / `tools/rpc/rpc-server.cpp` | modified | Build 30 -> 31 |
+| `tests/bench-cpu-kern.cpp` | new | kernel-level A/B benchmark: real kernel entry point + independent scalar reference + interleaved in-process measurement (built only with `LLAMA_BUILD_TESTS=ON`, not shipped) |
+| `tests/q4k_gemv_body.inc` / `tests/CMakeLists.txt` | new / modified | baseline copy of the kernel body extracted from `repack.cpp`, plus the benchmark target |
+| `bench/gen_q4k_body.py` / `bench/build_bench_cpu_kern.bat` | new | regenerate the baseline kernel body / build the separate `build-bench` tree in one step |
+
+Measured on this machine (i5-10400 / 8 GB, a training job running in the background; every number is a
+median of interleaved in-process runs):
+
+| Metric | Before | After |
+|---|---:|---:|
+| kernel bandwidth, single thread (18 MiB matrix, DRAM resident) | 6.00-6.47 GB/s | 6.63-6.78 GB/s (**+13.0%**) |
+| end-to-end decode `tg32` (Qwen3.5-0.8B Q4_K_M, `-t 4`, Clang) | 13.66 t/s | 15.53 t/s (**+13.7%**) |
+| end-to-end decode `tg32` (MSVC delivery variant, paired median) | - | **+13%** |
+| prefill `pp128` | 79-89 t/s | 87-89 t/s (unchanged, the GEMM path is untouched) |
+| L3 resident small matrix (0.56 MiB) | 10.07 GB/s | 10.30 GB/s (within noise) |
+
+Correctness: the patched kernel produces **bit-identical** output to the previous one (`memcmp`);
+greedy decoding (`--temp 0`) of the real engine yields exactly the same text as Build 30; all 7
+experimental variants match an independent scalar reference (`max_abs_err = 4.8e-07`, tolerance 2.9e-06).
+
+## 0.1 CLI multi-turn fix (Build 30)
+
+MoE chat answered `None` from the 2nd turn on: the CLI unconditionally appended the assistant message
+(possibly an empty string) to its history, so a turn that produced no visible output left a dangling
+empty assistant message there. Every later request then looked like `[user, assistant(""), user]` and
+strict MoE chat templates made the model emit a placeholder token for good. Also fixed the infinite
+`> ` loop after stdin was closed.
+
+| File | Type | Change |
+|------|------|--------|
+| `tools/cli/cli-context.cpp` | modified | empty / failed turns are no longer stored in the history (`[empty response: ...]` is printed, `--output` gets no empty section); an empty read is treated as EOF and exits; empty model selection returns failure; `a.finish()` is called at the end of every turn |
+| `tools/cli/cli-ui.h` | modified | `ui::assistant_turn::finish()` closes `[End thinking]` and resets colour / trailing-newline state at the end of a turn |
+| `CMakeLists.txt` / `tools/rpc/rpc-server.cpp` | modified | Build 29 -> 30 |
+
+Measured: `printf '你好\n1+1=?\n' | cli` produced an endless `> ` stream on Build 29
+(1,483,183 lines in 300 s) and exits normally with `Exiting...` (37 lines, exit 0) on Build 30.
+
+## 0.2 `--mask-history` training-path issue + normalisation (Build 29)
+
+Measured: same token stream, `-c 4096`, per-batch loss ~11.9 with `--mask-history` vs ~1.47 with
+`--no-mask-history` (two runs each, bit-identical; labels verified correct; inference PPL of the same
+text is 2.03). **Train with `--no-mask-history`.**
+
+| File | Type | Change |
+|------|------|--------|
+| `ggml/src/ggml-opt.cpp` / `ggml/include/ggml-opt.h` | modified | new `ggml_opt_result_add_rows()`; loss/accuracy normalise by the evaluated row count `nrows` instead of `ndata` (dataset points) |
+| `src/llama-context.cpp` | modified | report `n_ubatch` rows per evaluated ubatch |
+| `tools/lumina-train/lumina-train.cpp` | modified | note about the `--mask-history` path and the recommended configuration |
+| `CMakeLists.txt` / `tools/rpc/rpc-server.cpp` | modified | Build 28 -> 29 |
+
+## 0.3 Training-loss reporting note (Build 28)
+
+The progress-bar loss is a cumulative mean; the CE kernel averages over all rows while
+`ggml_opt_result_loss()` compensates with `ndata/nlabeled` (dataset points vs labelled rows - different
+units), so right after a long masked prompt the value is inflated ~8x (same tokens, same positions:
+masked 11.88 vs unmasked 1.44). Gradients are unaffected. A note is printed when `--mask-history` is on;
+judge progress with `--dataset-val`.
+
+| File | Type | Change |
+|------|------|--------|
+| `tools/lumina-train/lumina-train.cpp` | modified | removed the incorrect `-c > 2048` warning; added the `--mask-history` note |
+| `CMakeLists.txt` / `tools/rpc/rpc-server.cpp` | modified | Build 27 -> 28 |
+
+## 0.4 Disk-backed training dataset (Build 27)
+
+The trainer used to accumulate the entire dataset in two `std::vector`s
+(`int32` token ids + `uint8` trainability mask = **5 bytes per token**) and only then serialise it
+to a temp file for mmap. A 1.18 B token corpus therefore needed ~**5.9 GiB** of extra RAM before
+training even started.
+
+| File | Type | Change |
+|------|------|--------|
+| `tools/lumina-train/lumina-train.cpp` | modified | disk sink on `lumina_token_stream` (`FILE*` + `sink_n` / `sink_trainable` / `sink_dir`); `lumina_append()` writes ids and mask with `fwrite`; new `lumina_stream_begin/finish/discard()` and `lumina_append_padding()`; `lumina_stream_view` gained `map_file()` + `map_streamed()`, and `size()` / `n_trainable()` cover both modes |
+| same | modified | temp files are per process: `%TEMP%\lumina-train\<tag>-<pid>\` (Build 26 let two trainers share `train.stream.bin`) |
+| `ggml/src/ggml-opt.cpp` | modified | progress bar reports `tok/s`; `ggml_opt_result_loss()` returns `NAN` when the result holds no batch yet (prints `loss=n/a` instead of 0.0). A `loss=0.00000` on the first validation micro-batch has a different cause (that micro-batch only contains masked prompt tokens); Build 26 behaves the same |
+| build scripts (10 `.bat`) | modified | hardcoded `C:\Lumina-Engine` replaced with `%~dp0`; `build-clang.bat` takes `--target` |
+| `CMakeLists.txt` / `tools/rpc/rpc-server.cpp` | modified | Build 26 -> 27 |
+
+The on-disk layout is unchanged (`[n x int32][pad to 64 B][n x uint8]`), so the trainer reads
+byte-identical data:
+
+| Version | peak RSS while loading 300 M tokens | dataset stats |
+|---|---|---|
+| Build 26 | 2074 MB | 29282 rec / 300,021,789 tok / 278,340 datapoints |
+| Build 27 | **645 MB** | identical |
+
+## 0.5 Training gradient-accumulator fix (Build 26)
 
 For the `llama-finetune` / `llama_opt_epoch()` path (`Lumina-Engine-train`) with
 `n_batch / n_ubatch > 1`, the old code never cleared the gradient accumulators: every optimizer
@@ -29,7 +128,7 @@ grew without bound and the loss climbed (approximately linearly).
 
 ---
 
-## 0.1 Unified console startup screen (Build 24)
+## 0.6 Unified console startup screen (Build 24)
 
 Every console tool now prints the same Lumina-Engine startup screen (ASCII logo + build number +
 project links):
@@ -350,7 +449,7 @@ inference code involved; see [Delivery](Delivery.en.md)):
 | `bench/build_haswell.bat` / `bench/build_x64.bat` | single-variant incremental builds (dev) |
 | `bench/bench_lut2.cpp` | standalone Q1LUT kernel micro-benchmark (with correctness checks) |
 
-**Convention**: `Lumina-Engine-Bin` is the only delivery directory; the old `C:\Lumina-Engine\llama` entry has
+**Convention**: `Lumina-Engine-Bin` is the only delivery directory; the old `D:\Lumina-Engine\llama` entry has
 been removed.
 
 ---

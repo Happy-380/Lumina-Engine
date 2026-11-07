@@ -143,6 +143,29 @@ CMake without `GGML_CPU_ALL_VARIANTS` and compile for the host.
 
 ---
 
+## Chat / CLI
+
+### Q: An MoE model answers `None` from the second turn on?
+
+Fixed in Build 30. Root cause: the CLI appended every assistant reply to its history without checking
+whether it was empty. A turn without visible output (first token is EOS, interrupted stream, empty
+`content`, failed request) left a dangling empty assistant message in the history, so every later
+request looked like `[user, assistant(""), user]` and strict MoE chat templates made the model emit a
+placeholder token for good. Since Build 30, empty / failed turns are not added to the history
+(`[empty response: nothing was added to the chat history]`). On an older build, `/clear` recovers.
+
+### Q: `echo "..." | Lumina-Engine-cli.exe` (or a closed stdin) never exits and keeps printing `> `?
+
+Fixed in Build 30 (an empty read is EOF and exits, matching upstream llama.cpp #29722). Older builds
+spin forever and need Ctrl+C / kill.
+
+### Q: The reasoning trace never gets its closing `[End thinking]`?
+
+Since Build 30 every turn closes it (including interrupted streams and errors); older builds only
+closed it on a reasoning -> content transition.
+
+---
+
 ## Sampling
 
 Recommended parameters (matching the model vendor):

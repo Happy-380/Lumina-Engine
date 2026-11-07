@@ -246,7 +246,8 @@ bool cli_context::list_and_ask_models() {
         ui::user_turn user_turn;
         selection = user_turn.read_input(false, "Select model by number: ");
         if (selection.empty()) {
-            continue;
+            // an empty read is EOF (stdin closed) - do not spin forever on it
+            return false;
         }
         try {
             size_t idx = std::stoul(selection);
@@ -394,6 +395,9 @@ bool cli_context::generate_completion(generated_content & content_out, cli_timin
 
     cli_context::interrupted().store(false);
 
+    // always close an open reasoning block, even if the stream was cut short or an error happened
+    a.finish();
+
     if (!err.empty()) {
         ui::show_error(format_error_message(err));
         return false;
@@ -495,8 +499,13 @@ int cli_context::run() {
             break;
         }
 
+        // a submitted line always ends with a newline, an empty read is EOF
+        if (buffer.empty()) {
+            break;
+        }
+
         // remove trailing newline
-        if (!buffer.empty() && buffer.back() == '\n') {
+        if (buffer.back() == '\n') {
             buffer.pop_back();
         }
 
@@ -614,30 +623,40 @@ int cli_context::run() {
 
         cli_timings timings;
         generated_content content;
-        generate_completion(content, timings);
+        const bool generated = generate_completion(content, timings);
 
-        json assistant_msg = {
-            {"role",    "assistant"},
-            {"content", content.content}
-        };
-        if (!content.reasoning.empty()) {
-            assistant_msg["reasoning_content"] = content.reasoning;
-        }
-        impl->messages.push_back(std::move(assistant_msg));
+        // An empty assistant turn must never enter the history: the next request would then
+        // carry a dangling "assistant with no content" message, which makes many models
+        // (notably MoE ones with a strict chat template) answer with a single bogus token
+        // such as "None" for every following turn.
+        const bool empty_reply = content.content.empty() && content.reasoning.empty();
 
-        if (output_file) {
-            std::string out_content = "Assistant:\n";
+        if (generated && !empty_reply) {
+            json assistant_msg = {
+                {"role",    "assistant"},
+                {"content", content.content}
+            };
             if (!content.reasoning.empty()) {
-                out_content += "[Start thinking]\n\n";
-                out_content += content.reasoning;
-                out_content += "[End thinking]\n\n";
+                assistant_msg["reasoning_content"] = content.reasoning;
             }
-            out_content += content.content;
-            if (!out_content.empty() && out_content.back() != '\n') {
+            impl->messages.push_back(std::move(assistant_msg));
+
+            if (output_file) {
+                std::string out_content = "Assistant:\n";
+                if (!content.reasoning.empty()) {
+                    out_content += "[Start thinking]\n\n";
+                    out_content += content.reasoning;
+                    out_content += "[End thinking]\n\n";
+                }
+                out_content += content.content;
+                if (!out_content.empty() && out_content.back() != '\n') {
+                    out_content += "\n";
+                }
                 out_content += "\n";
+                write_output_file(out_content);
             }
-            out_content += "\n";
-            write_output_file(out_content);
+        } else if (empty_reply) {
+            ui::show_info("\n[empty response: nothing was added to the chat history]");
         }
 
         if (params.show_timings) {

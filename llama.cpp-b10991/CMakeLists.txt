@@ -37,8 +37,15 @@ message("CMAKE_BUILD_TYPE=${CMAKE_BUILD_TYPE}")
 # Add path to modules
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake/")
 
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+# Lumina: allow the caller to send the runtime binaries straight to a delivery directory
+# (e.g. -DCMAKE_RUNTIME_OUTPUT_DIRECTORY=<repo>/Lumina-Engine-Bin) instead of duplicating
+# every exe/dll inside <build>/bin.
+if (NOT CMAKE_RUNTIME_OUTPUT_DIRECTORY)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+endif()
+if (NOT CMAKE_LIBRARY_OUTPUT_DIRECTORY)
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+endif()
 
 if (CMAKE_SOURCE_DIR STREQUAL CMAKE_CURRENT_SOURCE_DIR)
     set(LLAMA_STANDALONE ON)
@@ -152,7 +159,7 @@ include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/common.cmake)
 
 if (NOT DEFINED LLAMA_BUILD_NUMBER)
     # Lumina-Engine release identity (independent of the upstream git history)
-    set(LLAMA_BUILD_NUMBER        26)
+    set(LLAMA_BUILD_NUMBER        31)
 endif()
 if (NOT DEFINED LLAMA_BUILD_COMMIT)
     set(LLAMA_BUILD_COMMIT        ${BUILD_COMMIT})

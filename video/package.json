@@ -1,0 +1,14 @@
+{
+  "name": "video",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "npx --yes hyperframes@0.8.135 preview",
+    "check": "npx --yes hyperframes@0.8.135 check",
+    "render": "npx --yes hyperframes@0.8.135 render",
+    "publish": "npx --yes hyperframes@0.8.135 publish"
+  },
+  "dependencies": {
+    "gsap": "^3.14.2"
+  }
+}

@@ -309,6 +309,15 @@ endif()
 # TODO: make this test (and others) not link `libllama` as it is not needed [TAG_TESTS_LLAMA_LINK]
 llama_build(test-backend-ops.cpp)
 
+# micro-benchmark for the repacked CPU mat-mul kernels (Q4_K GEMV/GEMM)
+llama_build(bench-cpu-kern.cpp)
+target_include_directories(bench-cpu-kern PRIVATE ${CMAKE_SOURCE_DIR}/ggml/src ${CMAKE_SOURCE_DIR}/ggml/src/ggml-cpu)
+if (NOT MSVC)
+    # the experimental kernel variants are generated from the arch specific source,
+    # so this target has to be compiled with the same ISA extensions
+    target_compile_options(bench-cpu-kern PRIVATE -march=haswell)
+endif()
+
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
 llama_build_and_test(test-autorelease.cpp       LABEL "model")
 llama_build_and_test(test-backend-sampler.cpp   LABEL "model")

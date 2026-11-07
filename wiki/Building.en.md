@@ -116,10 +116,10 @@ Clang additionally builds `ivybridge/piledriver/cooperlake/zen4/sapphirerapids` 
 MSVC generates slightly better code for the tiled kernel (+11% vs Clang), and only Clang can build
 all 14 variants. The delivery therefore merges both:
 
-The repo root provides a one-command script; it assembles into `C:\Lumina-Engine\Lumina-Engine-Bin` by default:
+The repo root provides a one-command script; it assembles into `D:\Lumina-Engine\Lumina-Engine-Bin` by default:
 
 ```bat
-C:\Lumina-Engine\build-bin.bat
+D:\Lumina-Engine\build-bin.bat
 ```
 
 It is equivalent to:
@@ -140,10 +140,12 @@ copy C:\Windows\System32\vcruntime140.dll      ..\Lumina-Engine-Bin\
 copy C:\Windows\System32\vcruntime140_1.dll    ..\Lumina-Engine-Bin\
 ```
 
-> The block above is illustrative; the **actual script is `bench\assemble_bin.bat`**: it first
-> deletes and recreates `Lumina-Engine-Bin`, lays down the full clang output, overwrites the 9 MSVC
-> variants, and copies the 5 runtime libraries from `%SystemRoot%\System32` (no fallback to any old
-> delivery directory). See [Delivery](Delivery.en.md).
+> **Since Build 31 the Clang build links the final binaries directly into `Lumina-Engine-Bin`**
+> (`configure-clang.bat` passes `-DCMAKE_RUNTIME_OUTPUT_DIRECTORY` / `-DCMAKE_LIBRARY_OUTPUT_DIRECTORY`),
+> so there is no duplicated `build-clang\bin` anymore. `bench\assemble_bin.bat` now only
+> overlays the 9 MSVC CPU variants and copies the 5 runtime libraries from `%SystemRoot%\System32`
+> (it no longer deletes the delivery directory; without a Clang build it falls back to the MSVC base
+> plus the backed-up variants). See [Delivery](Delivery.en.md).
 >
 > CPU backend DLLs are independent modules using the C ABI; MSVC- and Clang-built CPU backends have
 > been verified to mix with a `ggml-base.dll` / tools built by the other compiler.
@@ -153,7 +155,7 @@ copy C:\Windows\System32\vcruntime140_1.dll    ..\Lumina-Engine-Bin\
 ## 6. Artifact layout
 
 ```
-build-*/bin/
+Lumina-Engine-Bin/          # since Build 31 also the Clang build's output directory
 ├─ ggml-base.dll          # tensors / memory / graph
 ├─ ggml.dll               # scheduler
 ├─ ggml-rpc.dll           # RPC backend
@@ -167,7 +169,7 @@ build-*/bin/
 
 `Lumina-Engine-Bin/` (at the repo root, next to the source directory) is the final 53-file delivery
 set (14 CPU variants + runtime libraries), and it is the **only** delivery directory; the
-`build-*/bin/` outputs above are just build intermediates. The old `C:\Lumina-Engine\llama` entry has been
+The clang build writes straight into `Lumina-Engine-Bin/`; only the MSVC tree keeps its own `build-release\bin` (it is where the 9 MSVC variants and the no-clang fallback come from). The old `D:\Lumina-Engine\llama` entry has been
 removed. You can also call `bench\assemble_bin.bat` directly to assemble only. See [Delivery](Delivery.en.md).
 
 ---

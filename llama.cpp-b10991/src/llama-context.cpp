@@ -3638,6 +3638,9 @@ void llama_context::opt_epoch_iter(
                     // loss/accuracy are normalised over trainable tokens instead of all tokens
                     if (result != nullptr) {
                         ggml_opt_result_add_nlabeled(result, n_labeled);
+                        // Build 29: the CE kernel averages over all rows, so the getters need the
+                        // row count of the evaluated batches to rescale to per-labelled-token.
+                        ggml_opt_result_add_rows(result, (int64_t) n_ubatch);
                     }
                 }
             }
@@ -3695,6 +3698,7 @@ void llama_context::opt_epoch(
         opt_epoch_iter(dataset, result_train, tokens, labels_sparse, batch,
             callback_train, train, idata_in_loop, ndata_in_loop, t_loop_start, ubatch_skip);
     }
+
 
     t_loop_start = ggml_time_us();
     ndata_in_loop = (ndata - idata_split)*ubatch_per_ctx;

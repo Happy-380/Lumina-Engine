@@ -6,7 +6,7 @@ set "LUMINA_ROOT=%~dp0..\..\llama.cpp-b10991"
 set "LUMINA_BUILD=%~dp0..\..\llama.cpp-b10991\build-vulkan"
 
 set "VS_VCVARS=C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Auxiliary\Build\vcvars64.bat"
-set "VULKAN_SDK=C:\VulkanSDK\1.4.350.0"
+set "VULKAN_SDK=D:\VulkanSDK\sdk"
 set "CMAKE_BIN=C:\Program Files\CMake\bin"
 
 if not exist "%VS_VCVARS%" (

@@ -106,6 +106,9 @@ Lumina-Engine-cli.exe -m model.Q4_K_M.gguf --lora model.lora.gguf -p "..." -n 12
   因此与推理时的 chat 格式一致；
 * 默认 **`--mask-history`**：只对 `assistant` 回合计算 loss，system / user 及模板标记被掩码
   （通过在标签里写入 `-1` 哨兵实现，掩码位置的 loss 与梯度严格为 0）；
+* ⚠️ **但训练时请显式加 `--no-mask-history`**（Build 29 实测：同一 token 流下 `--mask-history`
+  的 loss 偏高约 8 倍、据此训出的适配器质量差）。代价是 prompt token 也计入损失（约 10–15%）。
+  详见 `HANDOFF.md` Build 29/30；
 * 纯文本记录始终对整个序列计算 loss；
 * 训练集与验证集可分开指定（`--dataset-val`）；同一个 token 流内部的验证集用 `--val-split` 切分。
 
@@ -117,6 +120,12 @@ Lumina-Engine-cli.exe -m model.Q4_K_M.gguf --lora model.lora.gguf -p "..." -n 12
 继续训练（`llama_adapter_lora_copy_weights()`）。
 
 > `-lora-targets` 也会匹配 `wq/wk/wv/wo/w1/w2/w3` 等命名，适配不同架构。
+>
+> ⚠️ **Build 30 起**：内存不够时训练器会自动**缩减** targets（日志
+> `lumina_fit_lora_targets: ... dropping MoE expert FFN targets`）。例如 8 GB 机器上 MoE 基座的默认
+> 集合会从 `…,ffn_up,ffn_down` 退化为 `attn_q,attn_k,attn_v,attn_output,ffn_gate_inp`
+> （AdamW 7.00 → 0.25 GiB），即专家 FFN 适配器根本没训。想训专家 FFN 就显式传 `-lora-targets`，
+> 并在日志里确认没有出现 `dropping MoE expert FFN targets`。
 
 ---
 

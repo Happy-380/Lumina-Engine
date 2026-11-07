@@ -1,10 +1,31 @@
 # Lumina-Engine 三段式训练流程（Stage1 → Stage2 → Stage3）
 
 > 适用：`SmallThinker-4BA0.6B-Instruct`（MoE）QLoRA 三阶段微调
-> 工具：`C:\Lumina-Engine\Lumina-Engine-Bin\Lumina-Engine-train.exe`（Build 26）
+> 工具：`Lumina-Engine-Bin\Lumina-Engine-train.exe`（Build 31）
+>
+> **Build 30 起：本文所有示例命令已显式加 `--no-mask-history`。** 另外两点来自 Build 30 的命令复核：
+> ① 8 GB 机器上默认 LoRA targets 会被**静默缩减**（MoE 专家 FFN `ffn_up/ffn_down` 被丢掉，只留
+> `attn_*` + `ffn_gate_inp`，AdamW 7.00 → 0.25 GiB）——想训专家 FFN 就用 `--lora-targets` 显式指定，
+> 并在日志里确认没有 `dropping MoE expert FFN targets`；
+> ② `-c 32768` 在 8 GB 上 RSS 峰值约 4.0 GB、可用物理内存只剩 ~0.9 GB（`--resume` 的 KV 重放阶段尤其慢），
+> 本文用 `-c 8192` 是经过验证的口径；换 `-c` 续训会让续训位置按新窗口重算。详见 `HANDOFF.md` Build 30。
+>
+> **Build 29：训练请加 `--no-mask-history`。** 实测 `--mask-history`（默认）在训练路径上 loss 偏高约 8 倍
+> （同 token 流、确定性复现：11.9 vs 1.47），据此训练的适配器质量差；`--no-mask-history` 正常。
+> 代价是 prompt token 也计入损失（约 10–15%）。详见 `HANDOFF.md` Build 29。
+>
+> **Build 28：进度条 loss 是累计均值，已标注行较少时（长掩码 prompt 之后）会被放大约 8 倍**，
+> 训练本身不受影响；请用 `--dataset-val` 判断收敛。长上下文训练经对照实验确认可用
+> （`-c 8192` 实测 23.9 tok/s，推理 PPL 随上下文变长而下降）。
+> **Build 27 起：数据集是「边解析边落盘」的（磁盘流式）。** 加载阶段不再把整份语料累计到内存，
+> 峰值内存从 5 B/token 降为 O(一个记录)，因此 `--dataset` 可以指向远超物理内存的语料；
+> 进度条每行末尾新增 `tok/s` 实时吞吐。临时文件写到 `%TEMP%\lumina-train\<tag>-<pid>\`，
+> 同一台机器上并发跑两个训练不会互相覆盖（Build 26 会）。其余参数与产物格式不变。
 >
 > Build 20 起训练已支持长上下文低内存：注意力反向现场重算 + 数据集内存映射，
-> `-c 32768` 在 8 GB 机器上可稳定运行而不进入磁盘交换（详见 `OPTIMIZATION_LOG.md`）。
+> `-c 8192` 在 8 GB 机器上可稳定运行而不进入磁盘交换（详见 `OPTIMIZATION_LOG.md`）。
+> **Build 30 实测**：`-c 32768` + `-lora-rank 64` + MoE 基座 + `--resume` 时 RSS ≈ **4.0 GiB**、
+> 可用物理内存只剩 ~0.9 GiB（KV 重放阶段明显变慢），8 GB 机器建议 `-c 8192 ~ 16384`。
 >
 > Build 21 修复了 `--resume`：恢复训练时从检查点所在**数据点 / 微批**继续（不再从第 1 步重来）；
 > 已训练过的前缀只做前向以重建 KV cache，不产生梯度、不更新权重。
@@ -54,7 +75,7 @@ stage3.lora.gguf   ← 累计包含 stage1+stage2+stage3，单独加载即可
 | 用途 | 路径 |
 |------|------|
 | 基座模型 | `D:\SmallThinker-4BA0.6B-Instruct.Q4_K_M.gguf` |
-| 训练工具 | `C:\Lumina-Engine\Lumina-Engine-Bin\Lumina-Engine-train.exe` |
+| 训练工具 | `D:\Lumina-Engine\Lumina-Engine-Bin\Lumina-Engine-train.exe` |
 | Stage1 训练 / 验证 | `D:\Dataset\data\stage1_pt\train.jsonl` / `D:\Dataset\data\stage1_pt\val.jsonl` |
 | Stage2 训练 / 验证 | `D:\Dataset\data\stage2_sft\train.jsonl` / `D:\Dataset\data\stage2_sft\val.jsonl` |
 | Stage3 训练 / 验证 | `D:\Dataset\data\stage3_persona\train.jsonl` / `D:\Dataset\data\stage3_persona\val.jsonl` |
@@ -78,13 +99,15 @@ if not exist D:\Dataset\output mkdir D:\Dataset\output
 ### Stage1 —— 继续预训练（PT，`{"text": ...}`）
 
 ```bat
-C:\Lumina-Engine\Lumina-Engine-Bin\Lumina-Engine-train.exe -m D:\SmallThinker-4BA0.6B-Instruct.Q4_K_M.gguf --dataset D:\Dataset\data\stage1_pt\train.jsonl --dataset-val D:\Dataset\data\stage1_pt\val.jsonl -c 8192 -b 2048 -ub 128 --cpu-cores 0 -lr 1e-4 --epochs 1 -lora-rank 64 -lora-alpha 128 --save-steps 500 --save-every-epochs 1 --keep-last 3 -o D:\Dataset\output\stage1.lora.gguf
+D:\Lumina-Engine\Lumina-Engine-Bin\Lumina-Engine-train.exe -m D:\SmallThinker-4BA0.6B-Instruct.Q4_K_M.gguf --dataset D:\Dataset\data\stage1_pt\train.jsonl --dataset-val D:\Dataset\data\stage1_pt\val.jsonl -c 8192 -b 2048 -ub 128 --cpu-cores 0 -lr 1e-4 --epochs 1 -lora-rank 64 -lora-alpha 128 --save-steps 500 --save-every-epochs 1 --keep-last 3 -o D:\Dataset\output\stage1.lora.gguf --no-mask-history
 ```
+
+> 续训（用户常用）：在同样的命令后加 `--resume`；`--save-steps 50` 与 `--save-every-steps` 等价。
 
 ### Stage2 —— 长上下文指令微调（SFT，`{"messages": ...}`，从 stage1 继续）
 
 ```bat
-C:\Lumina-Engine\Lumina-Engine-Bin\Lumina-Engine-train.exe -m D:\SmallThinker-4BA0.6B-Instruct.Q4_K_M.gguf --dataset D:\Dataset\data\stage2_sft\train.jsonl --dataset-val D:\Dataset\data\stage2_sft\val.jsonl --init-lora D:\Dataset\output\stage1.lora.gguf -c 8192 -b 2048 -ub 128 --cpu-cores 0 -lr 5e-5 --epochs 2 -lora-rank 64 -lora-alpha 128 --save-steps 500 --save-every-epochs 1 --keep-last 3 -o D:\Dataset\output\stage2.lora.gguf
+D:\Lumina-Engine\Lumina-Engine-Bin\Lumina-Engine-train.exe -m D:\SmallThinker-4BA0.6B-Instruct.Q4_K_M.gguf --dataset D:\Dataset\data\stage2_sft\train.jsonl --dataset-val D:\Dataset\data\stage2_sft\val.jsonl --init-lora D:\Dataset\output\stage1.lora.gguf -c 8192 -b 2048 -ub 128 --cpu-cores 0 -lr 5e-5 --epochs 2 -lora-rank 64 -lora-alpha 128 --save-steps 500 --save-every-epochs 1 --keep-last 3 -o D:\Dataset\output\stage2.lora.gguf --no-mask-history
 ```
 
 > 如需 stage2 从基座独立训练（不接 stage1），删掉 `--init-lora D:\Dataset\output\stage1.lora.gguf` 即可；本文默认按 stage1 → stage2 → stage3 链式训练。
@@ -96,7 +119,7 @@ C:\Lumina-Engine\Lumina-Engine-Bin\Lumina-Engine-train.exe -m D:\SmallThinker-4B
 > **不传 `--init-lora` 就是从基座独立训练**——不是本文推荐的流程。
 
 ```bat
-C:\Lumina-Engine\Lumina-Engine-Bin\Lumina-Engine-train.exe -m D:\SmallThinker-4BA0.6B-Instruct.Q4_K_M.gguf --dataset D:\Dataset\data\stage3_persona\train.jsonl --dataset-val D:\Dataset\data\stage3_persona\val.jsonl --init-lora D:\Dataset\output\stage2.lora.gguf -c 2048 -b 2048 -ub 128 --cpu-cores 0 -lr 5e-5 --epochs 1 -lora-rank 64 -lora-alpha 128 --save-steps 500 --save-every-epochs 1 --keep-last 3 -o D:\Dataset\output\stage3.lora.gguf
+D:\Lumina-Engine\Lumina-Engine-Bin\Lumina-Engine-train.exe -m D:\SmallThinker-4BA0.6B-Instruct.Q4_K_M.gguf --dataset D:\Dataset\data\stage3_persona\train.jsonl --dataset-val D:\Dataset\data\stage3_persona\val.jsonl --init-lora D:\Dataset\output\stage2.lora.gguf -c 2048 -b 2048 -ub 128 --cpu-cores 0 -lr 5e-5 --epochs 1 -lora-rank 64 -lora-alpha 128 --save-steps 500 --save-every-epochs 1 --keep-last 3 -o D:\Dataset\output\stage3.lora.gguf --no-mask-history
 ```
 
 ---
@@ -128,7 +151,7 @@ C:\Lumina-Engine\Lumina-Engine-Bin\Lumina-Engine-train.exe -m D:\SmallThinker-4B
 训练中断后，原命令**加上** `--resume` 再跑一次即可（其余参数保持一致）：
 
 ```bat
-C:\Lumina-Engine\Lumina-Engine-Bin\Lumina-Engine-train.exe -m D:\SmallThinker-4BA0.6B-Instruct.Q4_K_M.gguf --dataset D:\Dataset\data\stage2_sft\train.jsonl --dataset-val D:\Dataset\data\stage2_sft\val.jsonl --init-lora D:\Dataset\output\stage1.lora.gguf -c 8192 -b 2048 -ub 128 --cpu-cores 0 -lr 5e-5 --epochs 2 -lora-rank 64 -lora-alpha 128 --save-steps 500 --save-every-epochs 1 --keep-last 3 --resume -o D:\Dataset\output\stage2.lora.gguf
+D:\Lumina-Engine\Lumina-Engine-Bin\Lumina-Engine-train.exe -m D:\SmallThinker-4BA0.6B-Instruct.Q4_K_M.gguf --dataset D:\Dataset\data\stage2_sft\train.jsonl --dataset-val D:\Dataset\data\stage2_sft\val.jsonl --init-lora D:\Dataset\output\stage1.lora.gguf -c 8192 -b 2048 -ub 128 --cpu-cores 0 -lr 5e-5 --epochs 2 -lora-rank 64 -lora-alpha 128 --save-steps 500 --save-every-epochs 1 --keep-last 3 --resume -o D:\Dataset\output\stage2.lora.gguf --no-mask-history
 ```
 
 > `--resume` 找的是**同名输出的检查点**；`--init-lora` 是**阶段起点**，两者可以同时出现：有检查点就用检查点，没有就用 `--init-lora`。
@@ -139,10 +162,10 @@ C:\Lumina-Engine\Lumina-Engine-Bin\Lumina-Engine-train.exe -m D:\SmallThinker-4B
 
 ```bat
 REM 人设推理：只挂 stage3（已累计 stage1+stage2+stage3）
-C:\Lumina-Engine\Lumina-Engine-Bin\Lumina-Engine-cli.exe -m D:\SmallThinker-4BA0.6B-Instruct.Q4_K_M.gguf --lora D:\Dataset\output\stage3.lora.gguf -p "你好，你是谁？" -n 128 -t 8
+D:\Lumina-Engine\Lumina-Engine-Bin\Lumina-Engine-cli.exe -m D:\SmallThinker-4BA0.6B-Instruct.Q4_K_M.gguf --lora D:\Dataset\output\stage3.lora.gguf -p "你好，你是谁？" -n 128 -t 8
 
 REM 通用指令 / Markdown：挂 stage2
-C:\Lumina-Engine\Lumina-Engine-Bin\Lumina-Engine-cli.exe -m D:\SmallThinker-4BA0.6B-Instruct.Q4_K_M.gguf --lora D:\Dataset\output\stage2.lora.gguf -p "用 Markdown 表格对比 HTTP 与 HTTPS" -n 256 -t 8
+D:\Lumina-Engine\Lumina-Engine-Bin\Lumina-Engine-cli.exe -m D:\SmallThinker-4BA0.6B-Instruct.Q4_K_M.gguf --lora D:\Dataset\output\stage2.lora.gguf -p "用 Markdown 表格对比 HTTP 与 HTTPS" -n 256 -t 8
 
 REM 想弱化人设强度：--lora-scaled D:\Dataset\output\stage3.lora.gguf:0.8
 ```
@@ -166,7 +189,7 @@ REM 想弱化人设强度：--lora-scaled D:\Dataset\output\stage3.lora.gguf:0.8
 如仓库里 `configs/*.yaml` 对应的 LLaMA-Factory。）
 
 ```bat
-C:\Lumina-Engine\Lumina-Engine-Bin\Lumina-Engine-train.exe -m D:\SmallThinker-4BA0.6B-Instruct.Q4_K_M.gguf --dataset D:\Dataset\data\stage3_persona\train.jsonl --dataset-val D:\Dataset\data\stage3_persona\val.jsonl --dataset-limit 500 -c 1024 -b 1024 -ub 128 --cpu-cores 8 -lr 5e-5 --epochs 1 -lora-rank 64 -lora-alpha 128 --save-steps 20 --keep-last 3 -o D:\Dataset\output\stage3.trial.lora.gguf
+D:\Lumina-Engine\Lumina-Engine-Bin\Lumina-Engine-train.exe -m D:\SmallThinker-4BA0.6B-Instruct.Q4_K_M.gguf --dataset D:\Dataset\data\stage3_persona\train.jsonl --dataset-val D:\Dataset\data\stage3_persona\val.jsonl --dataset-limit 500 -c 1024 -b 1024 -ub 128 --cpu-cores 8 -lr 5e-5 --epochs 1 -lora-rank 64 -lora-alpha 128 --save-steps 20 --keep-last 3 -o D:\Dataset\output\stage3.trial.lora.gguf --no-mask-history
 ```
 
 也可用 `--dataset-max-tokens 2000000` 限制 token 数。试跑通过后再去掉 `--dataset-limit` / `--dataset-max-tokens` 跑全量。

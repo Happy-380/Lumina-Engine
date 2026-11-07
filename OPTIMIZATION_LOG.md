@@ -4,6 +4,202 @@
 > 构建：MSVC 19.41（Build 12 起启用 Vulkan 1.4.363 后端）
 > 测试模型：`D:\Qwen3-0.6B-Q8_0.gguf`、`D:\phi-3-mini-128k-instruct.q4_k_m.gguf`、`D:\SmallThinker-4BA0.6B-Instruct.Q4_K_M.gguf`
 > 说明：本机 CPU 状态在长会话中有明显漂移（同一配置可差 20%+），因此下表以「同批次相邻测量」为准，绝对值仅供参考。
+> Build 31 起的测量环境：Windows 11 x64 / **i5-10400（6C12T，无 AVX512）/ 8 GB DDR4**；测量期间后台有
+> `Lumina-Engine-train.exe`（8 线程）在跑，绝对带宽会整体漂 20% 以上，因此改用「同一进程内交错 A/B + 多轮中位数」。
+
+---
+
+## Build 31（本次）：Q4_K GEMV 软件预取 —— CPU 解码吞吐 +13%
+
+**背景**：CPU 单 token 生成的时间几乎全部花在量化 GEMV 内核上（`ggml_gemv_q4_K_8x8_q8_K`，
+即 repack 后的 Q4_K×8 内核）。本机（i5-10400 / 6C12T / DDR4 / 8 GB）实测该内核单线程只能跑到
+**6.0–7.5 GB/s**，而同一线程纯流式读的上限是 **11.6–13.1 GB/s** —— 说明它不是因为带宽不够，
+而是**访存延迟没被填满**：一个 block 的 8 条 32B 载入要等上一个 block 的算术，乱序窗口覆盖不到。
+
+**改法**（`ggml/src/ggml-cpu/arch/x86/repack.cpp`，`ggml_gemv_q4_K_8x8_q8_K` 的 block 循环）：
+
+```c
+{
+    const char * pf = (const char *) (b_ptr + b + 2);   // 提前 2 个 block（每个 1152 B = 18 行）
+    for (size_t pf_off = 0; pf_off < sizeof(block_q4_Kx8); pf_off += 64) {
+        _mm_prefetch(pf + pf_off, _MM_HINT_T0);        // 整块拉进 L1
+    }
+}
+```
+
+**关键坑：不要加 `if (b + 2 < nb)` 边界判断**。加了之后热循环里的那次分支比末尾几次无用预取
+贵得多，实测 **-13%**（见下表 `prefetch f2+guard`）；而 `PREFETCHh` 对无效地址不会 fault，
+越过张量末尾是无害的。
+
+**测法**（可复现）：`bench\build_bench_cpu_kern.bat` 会另开一个 `build-bench` 树（不动交付树），
+编译 `llama.cpp-b10991/tests/bench-cpu-kern.cpp`：用 `ggml_quantize_chunk` 造真实 Q4_K 数据 →
+按 loader 的规则 interleave → 调**真实内核入口**（`repack.h` 声明）→ 与**独立标量参考**逐列比对 →
+在**同一进程内交错**跑各变体（抵消 CPU 频率/后台负载漂移）。变体代码由 `bench/gen_q4k_body.py`
+从 `repack.cpp` 原文抽取生成（`tests/q4k_gemv_body.inc`），除注入的预取外与出厂代码逐字相同。
+
+**内核级，单线程，18 MiB 矩阵（DRAM 驻留），24 轮交错中位数**：
+
+| 变体 | 中位数 | 最好 25% | 相对出厂 |
+|---|---:|---:|---:|
+| 出厂（未改） | 6.00–6.47 GB/s | 6.45–7.12 | — |
+| 预取整块 +1 | 6.56–7.37 | 7.29–8.17 | **+7…+19%** |
+| 预取整块 +2 | 6.34–7.72 | 7.03–8.45 | **+10…+19%** |
+| 预取整块 +4 | 6.37–7.15 | 6.98–7.92 | +7…+14% |
+| 预取整块 +2 **带边界判断** | 5.49–5.73 | 5.89–6.44 | **-4…-15%** |
+| 只预取块首行 +2 | 4.78–5.63 | 5.35–6.16 | -14…-28% |
+| 改后（`shipped`） | 6.78 | 7.73 | **+13.6%** |
+
+> 每格是多轮测量的区间（后台有训练任务，绝对带宽整体会漂 ±20%，同一进程内交错比的相对值稳定得多）。
+> 复现确认（删掉 `build-bench` 后用 `bench\build_bench_cpu_kern.bat` 重新生成，20 轮）：
+> `copy(pdist=0)` 5.87 GB/s / `shipped` 6.63 GB/s = **+13.0%**，`prefetch full 2` 6.61（与 shipped 一致）。
+
+**端到端（真实模型 `Qwen3.5-0.8B-Q4_K_M.gguf`，4 线程，`llama-bench -p 16 -n 32`）**：
+
+| 组合 | 解码 tg32 | 说明 |
+|---|---:|---|
+| Clang 构建 · 改前 | 13.40 / 13.45 / 13.54 / 13.78 / 14.12 / 14.49（中位 **13.66**） | `build-clang` |
+| Clang 构建 · 改后 | 13.72 / 15.28 / 15.49 / 15.53 / 16.31 / 16.74（中位 **15.53**） | clang（`build-bench` 树）+ 预取，**+13.7%** |
+| MSVC 变体 · 改前 | 5.82 / 6.26 / 7.70 / 7.86 / 8.24 / 9.16 / 9.82（中位 **7.86**） | 交付包里的 `ggml-cpu-haswell.dll` |
+| MSVC 变体 · 改后 | 4.85 / 6.60 / 6.72 / 8.64 / 9.28 / 10.68 / 13.65（中位 **8.64**） | 逐对中位比 **+13%** |
+
+- 预填充未受影响：`pp128` 改前 79.15 / 86.05 / 87.59 / 89.04，改后 87.42 / 87.60 / 89.08 / 89.46
+  （GEMM 路径没动，这也是预期）。
+- **L3 驻留时无收益也无损失**：0.56 MiB 矩阵 14 轮，改后 10.30 / 改前 10.07 GB/s（噪声内）。
+
+**正确性**：
+
+| 检查 | 结果 |
+|---|---|
+| 7 个变体 vs 独立标量参考（每列 dequant 后点乘，double 累加） | `max_abs_err = 4.8e-07`（|ref|max ≈ 3.5，容差 2.9e-06）全部 OK |
+| 改后内核输出 vs 改前内核输出 | **逐位相同**（`memcmp` 一致，预取不参与任何算术） |
+| 真实引擎贪心解码（`--temp 0 --seed 1234 -n 48`，改前/改后各一次） | 输出文本 **md5 相同** |
+| `Lumina-Engine-Bin` 冒烟（Qwen3.5-0.8B，2 轮思考输出） | 正常，`--version` = `build 31` |
+
+**交付**（Build 31，两棵构建树全部重编）：
+
+| 项 | 状态 |
+|---|---|
+| 版本号 | `CMakeLists.txt` 的 `LLAMA_BUILD_NUMBER` 与 `tools/rpc/rpc-server.cpp` 的 `LUMINA_RPC_BUILD_NUMBER` 都 30 → **31** |
+| `build-clang`（Clang 20，14 变体 + 全部工具） | 删除后重新 configure + 全量重编，**513 目标 0 error**（原缓存指向 `D:\Lumina-Engine`，直接构建会报 CMakeCache 目录不一致） |
+| `build-release`（MSVC，9 变体 + 全部工具） | 重新 configure + 增量重编，0 error |
+| Vulkan | **已装回 Vulkan SDK 1.4.363**（官方安装包载荷解包到 `D:\VulkanSDK\sdk`，无需管理员）；两棵树以 `-DGGML_VULKAN=ON` 重新 configure 并编译，Bin 多出 `ggml-vulkan.dll`（55 文件） |
+| `Lumina-Engine-Bin` | `bench\assemble_bin.bat` 重新组装：**54 文件 / 14 变体**，`--version` = `build 31`，`ggml-rpc-server` 也是 `Build 31` |
+| Kaggle | `kaggle/src/Lumina-Engine-src.zip` 重新生成（10,635,903 B，sha256 `746d13e1…e855e87`）；notebook 重新生成；`build_cuda.sh` / `make_notebook.py` 的版本校验改为 `Build 31` |
+| 构建产物布局 | clang 构建改为**直接输出到 `Lumina-Engine-Bin`**（`configure-clang.bat` + `llama.cpp-b10991/CMakeLists.txt` 尊重 `CMAKE_RUNTIME/LIBRARY_OUTPUT_DIRECTORY`），`build-clang\bin` 重复副本（约 78 MB）已删除；`bench\assemble_bin.bat` 改为只覆盖 9 个 MSVC 变体 + 拷贝运行库 |
+| 文档 | `README(.en).md`、`HANDOFF.md`、`KAGGLE_TEST.md`、`TRAINING_PIPELINE.md`、`wiki/*.md` 均按 Build 31 更新 |
+
+**顺带确认的结论**：
+- 同一机器上 `ggml_gemv_q4_0_8x8_q8_0`（LUT 版）与 Q4_K 版吞吐基本一致（≈9 GB/s L3 驻留），
+  所以「把 Q4_K 改成 q4_0 那种 LUT 查表」没有 2 倍空间，本次没有采用。
+- X86 上没有 Q6_K 的 repack 内核（只有 ARM/Q2_K 有），Q6_K 走普通 AVX2 `vec_dot`；
+  它是下一个可动的目标（本机 Qwen3.5-0.8B 里 Q6_K 约占解码字节数的 1/4）。
+
+---
+
+## Build 30（历史）：CLI 多轮对话修复（空 assistant 轮污染历史）+ stdin EOF 死循环
+
+**症状**：MoE 模型对话时，第二轮及之后都只回 `None`，且无法自愈。
+
+**根因**：CLI 每轮无条件把 `{"role":"assistant","content":...}` 追加进历史。只要某轮没有可见输出
+（首 token 即 EOS / 流中断 / content 解析为空 / 请求报错），这条空 assistant 轮就永久留在
+`impl->messages` 里；下一轮请求变成 `[user, assistant(""), user]`，严格 chat template 的 MoE 模型
+把空 assistant 段当作缺失字段，从此每轮只回一个占位串。
+
+**改法**（`tools/cli/cli-context.cpp` + `tools/cli/cli-ui.h`）：
+
+| 位置 | 内容 |
+|---|---|
+| `cli_context::run()` | `generate_completion()` 返回值生效；`content`/`reasoning` 同时为空的轮次不再入历史，改打印 `[empty response: nothing was added to the chat history]`（`--output` 也不写空段） |
+| 同上（输入循环） | 空读取 = EOF → `break`；空行仍 `continue`（保留了跳过空消息的行为） |
+| `list_and_ask_models()` | 空选择返回 `false`（原为 `continue` 死循环） |
+| `ui::assistant_turn` | 新增 `finish()`，每轮结束（含中断/报错）补 `[End thinking]` 并复位颜色/行尾状态 |
+
+**实测（8 GB / 12 线程 / 纯 CPU，同一个 Build 29 二进制作对照）**
+
+| 场景 | Build 29 | Build 30 |
+|---|---|---|
+| `printf '你好\n1+1=?\n' \| cli -m SmallThinker -c 1024 -t 6 -n 24` | 两轮正常 → 无限 `> `，300 s 写出 **1,483,183 行**，需 kill（exit 124） | 两轮正常 → `Exiting...`，**37 行**，exit 0 |
+| Qwen3.5-0.8B（thinking）2 轮 `--jinja` | `[Start thinking]` ×2、`[End thinking]` ×0 | ×2 / ×2，每轮闭合 |
+| SmallThinker + `--lora stage1.lora.ckpt-7100` 2 轮 | 正常 | 正常 |
+
+**构建**：Clang 增量 0 error（`cli-ui.h` / `cli-context.cpp` / `build-info` 重新编译），
+`bench\assemble_bin.bat` 重新组装 Bin（54 文件），`--version` = **build 30**，启动画面 `Build 30 (Based on llama.cpp b-10991)`。
+
+---
+
+## Build 29：`--mask-history` 训练路径损坏定位 + 归一化口径显式化
+
+**A/B（同一文件、同 token 流、各跑两次逐位一致）**，`-c 4096`，窗口 2,432–3,060 的每批 loss：
+
+| 运行 | loss |
+|---|---|
+| `--mask-history` | 11.916 11.884 12.026 11.884 11.863 |
+| `--no-mask-history` | 1.468 1.440 1.419 1.401 1.376 |
+
+标签经诊断核对无误（过渡批 21 行零 / 43 行 one-hot，argmax 与 `labels_sparse`、下一个 token 一致），
+token 流完全相同，推理侧同文本 PPL 2.03 → 问题出在「稀疏标签 → 训练前向」这一层
+（疑为 labels 与计算图缓冲别名）。**可用结论：训练改用 `--no-mask-history`。**
+
+代码：新增 `ggml_opt_result_add_rows()`；loss/accuracy 的「按已标注行归一化」改用实际评估行数
+`nrows`（原先用 `ndata`=数据集点数，单位不一致）；llama-context 每 ubatch 上报行数。
+实测两者数值一致（训练路径上 `ndata` 本就按行累加）→ 不改变既有输出，只把口径写清。
+
+构建：Clang 全量 0 error，Bin 重装，`--version` = build 29。
+长上下文训练按 `-c 8192 --no-mask-history` 重启（1,445 条 / 4.0M tokens，24.3 tok/s，ETA 46 h）。
+
+---
+
+## Build 28（历史）：训练 loss 显示口径修正（长上下文训练经实验确认可用）
+
+**更正**：Build 28 初稿曾判定「长上下文训练产出不可用适配器」，该结论来自误读进度条 loss，已被推翻。
+
+**决定性对照**（同一段 ChatML 文本、`-c 4096`、同位置 token）：
+
+| 位置 | chat 记录（prompt 掩码） | 纯 text（不掩码） |
+|---|---|---|
+| 2,432 | 10.00 | ~1.48 |
+| 2,560 | 11.88 | 1.44 |
+| 3,008 | 11.19 | 1.33 |
+
+原因：CE 核按**全部行**求均值（掩码行贡献 0 但进分母），而 `ggml_opt_result_loss()` 的补偿项
+`ndata/nlabeled` 用「数据集点数 / 已标注行数」（单位不一致），于是已标注行很少时读数被放大数倍。
+
+**其它实测**：纯 text 在同一 4k 窗口内 loss 3.00 → 1.20（单调下降）；推理 PPL `-c1024` 4.57 /
+`-c4096` 2.03 / `-c8192`(24k 文本) 3.05，且与 `-b/-ub` 无关 → 长上下文前向与推理均正常。
+吞吐：`-c1024` 27.5、`-c8192` 23.9、`-c32768` 14.2 tok/s。
+
+**代码改动**：删除 `-c > 2048` 的错误告警，改为 `--mask-history` 开启时的口径说明（用 `--dataset-val` 判断进度）。
+被判不安全的提速方案（跳过掩码反向 / f16 KV / repack）均未采用，原因见 HANDOFF.md §4。
+
+## Build 27：训练数据集磁盘流式落盘（内存不再随语料线性增长）
+
+**背景**：训练加载器把整个语料累计到两个 vector（`int32` ids + `uint8` mask = 5 B/token），
+加载完成才写临时文件并 mmap。1.18 B tokens 需要 ~5.9 GiB 匿名内存，8 GB 机器必然失败。
+
+**改动**（`tools/lumina-train/lumina-train.cpp`、`ggml/src/ggml-opt.cpp`）：
+
+| 文件 | 内容 |
+|---|---|
+| lumina-train.cpp | `lumina_token_stream` 增加磁盘 sink（`FILE*` + 计数 + `sink_dir`）；`lumina_append()` 直接 `fwrite` ids/mask；新增 `lumina_stream_begin/finish/discard` + `lumina_append_padding`；`lumina_stream_view` 拆出 `map_file()` 并新增 `map_streamed()` |
+| lumina-train.cpp | 每个进程使用 `%TEMP%\lumina-train\<tag>-<pid>\` 独立临时目录（避免并发/重叠 resume 互相覆盖） |
+| ggml-opt.cpp | 进度条追加实时 `tok/s`；`ggml_opt_result_loss()` 在 result 无 batch 时返回 `NAN`（显示 `loss=n/a`）。验证集首行的 `loss=0.00000` 另属「该 micro-batch 全为掩码 prompt」的既有口径 |
+| *.bat (10 个) | 去掉硬编码 `C:\Lumina-Engine`，改用 `%~dp0` 相对路径；`build-clang.bat` 传参改为 `--target` |
+
+**同数据 A/B（`engine_full/train.jsonl`，`--dataset-max-tokens 300000000`，i5-10400 / 8 GB）**：
+
+| 版本 | 加载峰值 RSS | 数据集就绪 RSS | 数据集统计 |
+|---|---|---|---|
+| Build 26 | 2074 MB | 1163 MB | 29282 rec / 300,021,789 tok（283,997,789 trainable）/ 278,340 datapoints |
+| Build 27 | **1371 MB** | 1371 MB | **完全相同** |
+
+`.stream.bin` 尺寸一致（60 M tokens：两者均 286.2 MiB）→ 训练器读到的字节不变。
+冒烟集（40 rec / 6929 tok / 3863 trainable / 12 datapoints）与短验证集掩码填充行为也与 Build 26 一致。
+
+**吞吐**：进度条现在直接给出 `tok/s`（本机 Qwen3.5-0.8B Q4_K_M：`-c 512` ≈ 30 tok/s，`-c 1024` ≈ 26–27 tok/s），
+优化本身不改变每 token 的算力需求，改变的是**可加载语料规模**（不再受 5 B/token 限制）。
+
+**回归项**：checkpoint 命名/元数据、`--resume`、`--dataset-limit/--dataset-max-tokens`、`--init-lora`、
+`--mask-history`、`--dataset-chat-template`、LoRA 目标挑选与原内存回退路径均未改动。
 
 ---
 
@@ -242,7 +438,8 @@ Bilibili   : https://space.bilibili.com/3546376302496335
 | 磁盘交换 | 发生 | **无** |
 
 **交付**：Build 20，MSVC 全量重建并组装到 `Lumina-Engine-Bin`（55 文件 / 14 个 CPU 变体）。
-Vulkan 后端 DLL 沿用 Build 19 产物（本机 Vulkan SDK 已卸载；后端 ABI 未变，训练为纯 CPU）。
+Vulkan 后端 DLL 沿用 Build 19 产物（当时本机 Vulkan SDK 已卸载；后端 ABI 未变，训练为纯 CPU）。
+> Build 31 已重新安装 Vulkan SDK 1.4.363 并重建 Vulkan 后端。
 
 ---
 

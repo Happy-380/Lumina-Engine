@@ -109,7 +109,33 @@ struct lumina_token_stream {
     int64_t                  n_text = 0;
     int64_t                  n_chat = 0;
     int64_t                  n_bad  = 0;
+
+    // Build 27: optional disk-backed sink. When enabled the loader writes the ids and the
+    // trainability mask straight to temp files instead of growing two vectors, so the peak
+    // RAM cost is one record instead of 5 bytes per token (a 1.2 B token corpus would
+    // otherwise need ~6 GiB before training even starts).
+    FILE *   sink_ids      = nullptr;
+    FILE *   sink_mask     = nullptr;
+    fs::path sink_dir;       // per-process subdirectory (two trainers must never collide)
+    fs::path sink_ids_path;
+    fs::path sink_mask_path;
+    int64_t  sink_n         = 0;   // tokens written to the sink
+    int64_t  sink_trainable = 0;   // of which trainable
+    bool     sink_error     = false;
+    bool     sink_used      = false; // true once a sink was opened (stays true after finish)
+
+    bool    streaming() const { return sink_used; }
+    int64_t size()      const { return sink_used ? sink_n : (int64_t) tokens.size(); }
+    int64_t n_trainable() const {
+        if (sink_used) {
+            return sink_trainable;
+        }
+        return (int64_t) std::count(trainable.begin(), trainable.end(), (uint8_t) 1);
+    }
 };
+
+// Build 27: forward declaration (the definition lives next to lumina_append).
+static bool lumina_stream_finish(lumina_token_stream & s, const fs::path & dir, const std::string & tag);
 
 // A read-only, pageable view of one token stream. A large `std::vector<llama_token>` is
 // anonymous private memory: when the machine runs short of RAM the OS can only reclaim it
@@ -160,7 +186,6 @@ struct lumina_stream_view {
         const size_t tok_bytes  = n * sizeof(int32_t);
         const size_t mask_bytes = s.trainable.size();
         const size_t mask_off   = (tok_bytes + 63) & ~(size_t) 63; // keep the mask aligned
-        const size_t total      = mask_off + mask_bytes;
 
         std::error_code ec;
         fs::create_directories(dir, ec);
@@ -191,6 +216,22 @@ struct lumina_stream_view {
                 return false;
             }
         }
+
+        return map_file(path, (int64_t) n, mask_bytes > 0);
+    }
+
+    // Map an assembled stream file: [n_tokens x int32][pad to 64 B][n_tokens x uint8 mask?].
+    // use_mask == false maps an all-trainable stream (the trainer then uses a NULL mask).
+    bool map_file(const fs::path & path, int64_t n_tokens_in, bool use_mask) {
+        if (n_tokens_in <= 0) {
+            return false;
+        }
+
+        const size_t tok_bytes = (size_t) n_tokens_in * sizeof(int32_t);
+        const size_t mask_off  = (tok_bytes + 63) & ~(size_t) 63; // keep the mask aligned
+        const size_t total     = use_mask ? mask_off + (size_t) n_tokens_in : tok_bytes;
+
+        map_path = path; // so a failure after this point is cleaned up by unmap()
 
 #if defined(_WIN32)
         file_handle = CreateFileW(path.wstring().c_str(), GENERIC_READ,
@@ -233,11 +274,20 @@ struct lumina_stream_view {
         map_base  = base;
         map_bytes = total;
         tokens    = (const int32_t *) base;
-        mask      = mask_bytes > 0
-                  ? (const uint8_t *) ((const char *) base + mask_off)
-                  : nullptr;
+        mask      = use_mask ? (const uint8_t *) ((const char *) base + mask_off) : nullptr;
+        n_tokens  = n_tokens_in;
 
         return true;
+    }
+
+    // Build 27: close the disk-backed sink, assemble `dir/tag.stream.bin` and map it.
+    bool map_streamed(lumina_token_stream & s, const fs::path & dir, const std::string & tag) {
+        if (!lumina_stream_finish(s, dir, tag)) {
+            return false;
+        }
+        // An all-trainable stream is mapped without a mask (same as drop_trivial_mask()).
+        const fs::path out = (s.sink_dir.empty() ? dir : s.sink_dir) / (tag + ".stream.bin");
+        return map_file(out, s.sink_n, s.sink_trainable != s.sink_n);
     }
 
     void unmap() {
@@ -261,15 +311,205 @@ struct lumina_stream_view {
 #endif
         if (!map_path.empty()) {
             std::error_code ec;
+            const fs::path parent = map_path.parent_path();
             fs::remove(map_path, ec);
+            // drop the per-process scratch directory if it is now empty
+            fs::remove(parent, ec);
             map_path.clear();
         }
     }
 };
 
 static void lumina_append(lumina_token_stream & out, const std::vector<llama_token> & toks, bool trainable) {
+    if (toks.empty()) {
+        return;
+    }
+
+    const uint8_t fill = (uint8_t) (trainable ? 1 : 0);
+
+    if (out.sink_ids != nullptr) {
+        if (fwrite(toks.data(), sizeof(llama_token), toks.size(), out.sink_ids) != toks.size()) {
+            out.sink_error = true;
+            return;
+        }
+        uint8_t buf[4096];
+        memset(buf, fill, sizeof(buf));
+        size_t left = toks.size();
+        while (left > 0) {
+            const size_t k = std::min<size_t>(left, sizeof(buf));
+            if (fwrite(buf, 1, k, out.sink_mask) != k) {
+                out.sink_error = true;
+                return;
+            }
+            left -= k;
+        }
+        out.sink_n += (int64_t) toks.size();
+        if (trainable) {
+            out.sink_trainable += (int64_t) toks.size();
+        }
+        return;
+    }
+
     out.tokens.insert(out.tokens.end(), toks.begin(), toks.end());
-    out.trainable.insert(out.trainable.end(), toks.size(), (uint8_t) (trainable ? 1 : 0));
+    out.trainable.insert(out.trainable.end(), toks.size(), fill);
+}
+
+// ---------------------------------------------------------------------------
+// Build 27: disk-backed token stream
+// ---------------------------------------------------------------------------
+
+// Open the sink. Returns false when the temp directory is not writable, in which case the
+// caller keeps using the in-memory vectors (previous behaviour).
+static bool lumina_stream_begin(lumina_token_stream & s, const fs::path & dir, const std::string & tag) {
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) {
+        return false;
+    }
+
+    // Build 27: a fixed file name would make two concurrent trainers (or a resumed run that
+    // overlaps a dying one) write into the same temp files. Isolate every process instead.
+#if defined(_WIN32)
+    const long long pid = (long long) GetCurrentProcessId();
+#else
+    const long long pid = (long long) getpid();
+#endif
+    const fs::path run_dir = dir / (tag + "-" + std::to_string(pid));
+    fs::create_directories(run_dir, ec);
+    if (ec) {
+        return false;
+    }
+
+    const fs::path ids_path  = run_dir / (tag + ".ids.tmp");
+    const fs::path mask_path = run_dir / (tag + ".mask.tmp");
+
+    FILE * fi = fopen(ids_path.string().c_str(), "wb");
+    if (fi == nullptr) {
+        return false;
+    }
+    FILE * fm = fopen(mask_path.string().c_str(), "wb");
+    if (fm == nullptr) {
+        fclose(fi);
+        fs::remove(ids_path, ec);
+        return false;
+    }
+
+    s.sink_ids      = fi;
+    s.sink_mask     = fm;
+    s.sink_dir      = run_dir;
+    s.sink_ids_path = ids_path;
+    s.sink_mask_path = mask_path;
+    s.sink_n         = 0;
+    s.sink_trainable = 0;
+    s.sink_error     = false;
+    s.sink_used      = true;
+    return true;
+}
+
+static void lumina_stream_discard(lumina_token_stream & s) {
+    if (s.sink_ids  != nullptr) { fclose(s.sink_ids);  s.sink_ids  = nullptr; }
+    if (s.sink_mask != nullptr) { fclose(s.sink_mask); s.sink_mask = nullptr; }
+
+    std::error_code ec;
+    if (!s.sink_ids_path.empty())  { fs::remove(s.sink_ids_path,  ec); s.sink_ids_path.clear();  }
+    if (!s.sink_mask_path.empty()) { fs::remove(s.sink_mask_path, ec); s.sink_mask_path.clear(); }
+
+    s.sink_n = 0;
+    s.sink_trainable = 0;
+}
+
+// Close the sink and assemble `dir/tag.stream.bin` = [ids][pad to 64 B][mask?].
+// The mask is omitted when every token is trainable so the trainer gets a NULL mask, which
+// is exactly what drop_trivial_mask() does for the in-memory path.
+static bool lumina_stream_finish(lumina_token_stream & s, const fs::path & dir, const std::string & tag) {
+    if (!s.streaming() || s.sink_ids == nullptr) {
+        return false;
+    }
+
+    bool ok = true;
+    if (fflush(s.sink_ids)  != 0) { ok = false; }
+    if (fflush(s.sink_mask) != 0) { ok = false; }
+    if (fclose(s.sink_ids)  != 0) { ok = false; }
+    if (fclose(s.sink_mask) != 0) { ok = false; }
+    s.sink_ids  = nullptr;
+    s.sink_mask = nullptr;
+
+    std::error_code ec;
+    if (!ok || s.sink_error || s.sink_n <= 0) {
+        LOG_ERR("%s: writing the '%s' token stream to disk failed\n", __func__, tag.c_str());
+        fs::remove(s.sink_ids_path,  ec);
+        fs::remove(s.sink_mask_path, ec);
+        return false;
+    }
+
+    const fs::path out = (s.sink_dir.empty() ? dir : s.sink_dir) / (tag + ".stream.bin");
+    fs::remove(out, ec);
+    fs::rename(s.sink_ids_path, out, ec); // the ids become the head of the stream file
+    if (ec) {
+        LOG_ERR("%s: cannot rename '%s' to '%s': %s\n", __func__,
+                s.sink_ids_path.string().c_str(), out.string().c_str(), ec.message().c_str());
+        fs::remove(s.sink_ids_path,  ec);
+        fs::remove(s.sink_mask_path, ec);
+        return false;
+    }
+    s.sink_ids_path.clear();
+
+    const bool   need_mask = s.sink_trainable != s.sink_n;
+    const size_t tok_bytes = (size_t) s.sink_n * sizeof(int32_t);
+    const size_t mask_off  = (tok_bytes + 63) & ~(size_t) 63;
+    const size_t total     = need_mask ? mask_off + (size_t) s.sink_n : tok_bytes;
+
+    fs::resize_file(out, (uintmax_t) total, ec); // the padding is zero-filled
+    if (ec) {
+        LOG_ERR("%s: cannot extend '%s' to %zu bytes: %s\n", __func__,
+                out.string().c_str(), total, ec.message().c_str());
+        return false;
+    }
+
+    if (need_mask) {
+        std::ifstream in(s.sink_mask_path.string(), std::ios::binary);
+        std::fstream   of(out.string(), std::ios::binary | std::ios::in | std::ios::out);
+        if (!in || !of) {
+            LOG_ERR("%s: cannot reopen the '%s' mask/stream files\n", __func__, tag.c_str());
+            return false;
+        }
+
+        of.seekp((std::streamoff) mask_off);
+        std::vector<char> buf(1u << 22);
+        size_t left = (size_t) s.sink_n;
+        while (left > 0 && of) {
+            const size_t k = std::min<size_t>(left, buf.size());
+            in.read(buf.data(), (std::streamsize) k);
+            if ((size_t) in.gcount() != k) {
+                LOG_ERR("%s: short read on '%s'\n", __func__, s.sink_mask_path.string().c_str());
+                return false;
+            }
+            of.write(buf.data(), (std::streamsize) k);
+            left -= k;
+        }
+        if (!of) {
+            LOG_ERR("%s: writing the '%s' mask into the stream file failed\n", __func__, tag.c_str());
+            return false;
+        }
+    }
+
+    fs::remove(s.sink_mask_path, ec);
+    s.sink_mask_path.clear();
+    return true;
+}
+
+// Append `n` non-trainable (mask = 0, id = 0) tokens; used to pad a short validation set.
+static void lumina_append_padding(lumina_token_stream & s, int64_t n) {
+    if (n <= 0) {
+        return;
+    }
+    std::vector<llama_token> chunk((size_t) std::min<int64_t>(n, 4096), 0);
+    while (n > 0) {
+        const size_t k = (size_t) std::min<int64_t>(n, (int64_t) chunk.size());
+        std::vector<llama_token> part(chunk.begin(), chunk.begin() + (std::ptrdiff_t) k);
+        lumina_append(s, part, /*trainable=*/false);
+        n -= (int64_t) k;
+    }
 }
 
 static bool lumina_load_dataset(
@@ -387,17 +627,17 @@ static bool lumina_load_dataset(
             LOG_INF("%s: reached --dataset-limit (%d records)\n", __func__, params.dataset_limit);
             break;
         }
-        if (params.dataset_max_tokens > 0 && (int64_t) out.tokens.size() >= params.dataset_max_tokens) {
+        if (params.dataset_max_tokens > 0 && out.size() >= params.dataset_max_tokens) {
             LOG_INF("%s: reached --dataset-max-tokens (%d tokens)\n", __func__, params.dataset_max_tokens);
             break;
         }
     }
 
-    const size_t n_trainable = (size_t) std::count(out.trainable.begin(), out.trainable.end(), (uint8_t) 1);
+    const int64_t n_trainable = out.n_trainable();
 
-    LOG_INF("%s: '%s': %" PRId64 " records (%" PRId64 " text, %" PRId64 " chat), %zu tokens (%zu trainable), %" PRId64 " skipped\n",
+    LOG_INF("%s: '%s': %" PRId64 " records (%" PRId64 " text, %" PRId64 " chat), %" PRId64 " tokens (%" PRId64 " trainable), %" PRId64 " skipped\n",
             __func__, path.c_str(), n_records, out.n_text, out.n_chat,
-            out.tokens.size(), n_trainable, out.n_bad);
+            out.size(), n_trainable, out.n_bad);
 
     return true;
 }
@@ -864,7 +1104,9 @@ int main(int argc, char ** argv) {
                 __func__, n_train_threads, params.cpu_cores);
     }
 
-    // KV cache must be F32 for training (no f16 backward pass for OUT_PROD)
+    // KV cache must be F32 for training: the backward pass needs an f32 OUT_PROD kernel and
+    // there is no f16 variant. This is also why the long-context KV traffic cannot simply be
+    // halved with -ctk f16 (see HANDOFF.md, Build 28).
     if (params.cache_type_k != GGML_TYPE_F32) {
         LOG_INF("%s: forcing k cache type to f32 for training\n", __func__);
         params.cache_type_k = GGML_TYPE_F32;
@@ -952,9 +1194,40 @@ int main(int argc, char ** argv) {
     // build the token streams (dataset file(s) or a single --file/-p text)
     // ------------------------------------------------------------------
     const int64_t n_ctx_train = llama_n_ctx(ctx);
+
+    // Build 28: the printed training loss is a cumulative average in which the *masked* rows of
+    // every batch dilute the per-batch mean (the CE kernel divides by all rows) while the
+    // normalisation compensates with a different unit (dataset points vs labelled rows). While a
+    // run has seen few labelled rows - exactly the case right after a long masked prompt - the
+    // displayed value is inflated several-fold and then decays towards the true loss. Measured on
+    // identical tokens at identical positions: masked chat record 11.88 vs the same text as a
+    // plain {"text"} record 1.44. Gradients never see masked rows, so training is unaffected -
+    // judge progress with --dataset-val, not with the first epochs of the progress bar.
+    if (params.mask_history) {
+        LOG_INF("%s: --mask-history is on: the displayed training loss is a cumulative average and is\n%s: inflated while few labelled rows have been seen (a long masked prompt at the start of a\n%s: window can make it look ~8x too high). Training is not affected; use --dataset-val to judge.\n%s", __func__, __func__, __func__, __func__);
+    }
     lumina_token_stream train_stream;
     lumina_token_stream val_stream;
     const bool has_val_file = !params.dataset_val.empty();
+
+    const fs::path stream_dir = fs::temp_directory_path() / "lumina-train";
+
+    // Build 27: stream the token ids/mask to disk while the dataset is parsed instead of
+    // accumulating them in two vectors. Peak RAM becomes O(one record) instead of
+    // O(5 bytes per token), so corpora far larger than the available memory now load fine.
+    // When the temp directory is unusable we transparently fall back to the vectors.
+    if (!params.dataset.empty()) {
+        if (lumina_stream_begin(train_stream, stream_dir, "train")) {
+            LOG_INF("%s: streaming the token ids/mask to '%s' (bounded RAM)\n",
+                    __func__, stream_dir.string().c_str());
+            if (has_val_file && !lumina_stream_begin(val_stream, stream_dir, "val")) {
+                LOG_WRN("%s: could not open the validation sink; keeping it in RAM\n", __func__);
+            }
+        } else {
+            LOG_WRN("%s: cannot write to '%s'; keeping the token stream in RAM "
+                    "(~5 bytes per token)\n", __func__, stream_dir.string().c_str());
+        }
+    }
 
     if (!params.dataset.empty()) {
         common_chat_templates_ptr tmpls;
@@ -977,13 +1250,17 @@ int main(int argc, char ** argv) {
             // prediction of any real token, and mask = 0 keeps the padding out of the loss.
             const int64_t stride_val = lumina_stream_stride(params.dataset_stride, n_ctx_train);
             const int64_t n_needed   = n_ctx_train + 1 + stride_val;
-            const int64_t n_have     = (int64_t) val_stream.tokens.size();
+            const int64_t n_have     = val_stream.size();
             if (n_have > 1 && n_have < n_needed) {
                 LOG_WRN("%s: validation set is shorter than one training window (%" PRId64 " tokens, a window is %" PRId64 "); "
                         "padding with %" PRId64 " masked tokens so the whole set is still evaluated\n",
                         __func__, n_have, n_ctx_train, n_needed - n_have);
-                val_stream.tokens.resize((size_t) n_needed, 0);
-                val_stream.trainable.resize((size_t) n_needed, 0);
+                if (val_stream.streaming()) {
+                    lumina_append_padding(val_stream, n_needed - n_have);
+                } else {
+                    val_stream.tokens.resize((size_t) n_needed, 0);
+                    val_stream.trainable.resize((size_t) n_needed, 0);
+                }
             }
         }
     } else {
@@ -997,10 +1274,12 @@ int main(int argc, char ** argv) {
         LOG_INF("%s: prompt tokens = %zu, n_ctx = %" PRId64 "\n", __func__, toks.size(), n_ctx_train);
     }
 
-    if ((int64_t) train_stream.tokens.size() <= n_ctx_train + 1) {
-        LOG_ERR("%s: training data is too short: %zu tokens, but the training context is %" PRId64 ".\n",
-                __func__, train_stream.tokens.size(), n_ctx_train);
+    if (train_stream.size() <= n_ctx_train + 1) {
+        LOG_ERR("%s: training data is too short: %" PRId64 " tokens, but the training context is %" PRId64 ".\n",
+                __func__, train_stream.size(), n_ctx_train);
         LOG_ERR("%s: provide more data via --dataset, or reduce -c (the context is rounded up to a multiple of 256).\n", __func__);
+        lumina_stream_discard(train_stream);
+        lumina_stream_discard(val_stream);
         return 1;
     }
 
@@ -1009,15 +1288,17 @@ int main(int argc, char ** argv) {
     // wasted. This happens when the chat template renders nothing usable (e.g. a shell or
     // batch file mangled the `%` of `{% ... %}`), so refuse to start instead of running dry.
     {
-        const size_t n_trainable = (size_t) std::count(train_stream.trainable.begin(), train_stream.trainable.end(), (uint8_t) 1);
+        const int64_t n_trainable = train_stream.n_trainable();
         if (n_trainable == 0) {
             LOG_ERR("%s: the training set has no trainable token (check --dataset-chat-template / --mask-history).\n", __func__);
+            lumina_stream_discard(train_stream);
+            lumina_stream_discard(val_stream);
             return 1;
         }
-        if (n_trainable * 100 < train_stream.tokens.size()) {
-            LOG_WRN("%s: only %.1f%% of the training tokens are trainable (%zu / %zu) -- is the chat template correct?\n",
-                    __func__, 100.0 * (double) n_trainable / (double) train_stream.tokens.size(),
-                    n_trainable, train_stream.tokens.size());
+        if (n_trainable * 100 < train_stream.size()) {
+            LOG_WRN("%s: only %.1f%% of the training tokens are trainable (%" PRId64 " / %" PRId64 ") -- is the chat template correct?\n",
+                    __func__, 100.0 * (double) n_trainable / (double) train_stream.size(),
+                    n_trainable, train_stream.size());
         }
     }
 
@@ -1042,9 +1323,16 @@ int main(int argc, char ** argv) {
     lumina_stream_view train_view;
     lumina_stream_view val_view;
 
-    const fs::path stream_dir = fs::temp_directory_path() / "lumina-train";
-
-    if (train_view.map_stream(train_stream, stream_dir, "train")) {
+    if (train_stream.streaming()) {
+        if (train_view.map_streamed(train_stream, stream_dir, "train")) {
+            LOG_INF("%s: mapped training token stream to '%s' (%.1f MiB, evictable)\n",
+                    __func__, train_view.map_path.string().c_str(), train_view.map_bytes/1048576.0);
+        } else {
+            LOG_ERR("%s: could not assemble/map the training token stream\n", __func__);
+            lumina_stream_discard(val_stream);
+            return 1;
+        }
+    } else if (train_view.map_stream(train_stream, stream_dir, "train")) {
         std::vector<llama_token>().swap(train_stream.tokens);
         std::vector<uint8_t>().swap(train_stream.trainable);
         LOG_INF("%s: mapped training token stream to '%s' (%.1f MiB, evictable)\n",
@@ -1054,7 +1342,15 @@ int main(int argc, char ** argv) {
     }
 
     if (has_val_file) {
-        if (val_view.map_stream(val_stream, stream_dir, "val")) {
+        if (val_stream.streaming()) {
+            if (val_view.map_streamed(val_stream, stream_dir, "val")) {
+                LOG_INF("%s: mapped validation token stream to '%s' (%.1f MiB, evictable)\n",
+                        __func__, val_view.map_path.string().c_str(), val_view.map_bytes/1048576.0);
+            } else {
+                LOG_ERR("%s: could not assemble/map the validation token stream\n", __func__);
+                return 1;
+            }
+        } else if (val_view.map_stream(val_stream, stream_dir, "val")) {
             std::vector<llama_token>().swap(val_stream.tokens);
             std::vector<uint8_t>().swap(val_stream.trainable);
             LOG_INF("%s: mapped validation token stream to '%s' (%.1f MiB, evictable)\n",
@@ -1116,7 +1412,7 @@ int main(int argc, char ** argv) {
     if (!full_finetune) {
         // reduce the LoRA target set if the MoE expert adapters would not fit in RAM
         lumina_fit_lora_targets(model, n_ctx_train,
-                train_stream.tokens.size() + val_stream.tokens.size(), params);
+                train_stream.size() + val_stream.size(), params);
 
         const std::vector<std::string> targets = lumina_split_targets(params.lora_targets);
 

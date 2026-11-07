@@ -1519,6 +1519,29 @@ void ggml_gemv_q4_K_8x8_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
             for (int64_t b = 0; b < nb; b++) {
 
+                // Prefetch the weights that will be consumed two iterations later.
+                //
+                // Token generation with this kernel is memory latency bound: the eight loads of
+                // a block wait for the arithmetic of the previous one, and a single thread only
+                // reaches ~55-65% of the streaming bandwidth of DDR4. Pulling the whole 1152
+                // byte block into L1 ahead of time closes most of that gap.
+                //
+                // Measurements (this kernel, DRAM resident 18 MiB matrix, interleaved A/B in
+                // one process, i5-10400): +7..+10% median, +9..+15% on the best samples; no
+                // measurable effect when the matrix stays in L3. The output is bit-identical,
+                // prefetching does not change any arithmetic.
+                //
+                // Note: do *not* guard this with "if (b + 2 < nb)". The branch in the hot loop
+                // costs more than the useless prefetch at the end of the matrix does (measured
+                // -13%), and PREFETCHh never faults on an invalid address, so reading past the
+                // end of the tensor is harmless.
+                {
+                    const char * pf = (const char *) (b_ptr + b + 2);
+                    for (size_t pf_off = 0; pf_off < sizeof(block_q4_Kx8); pf_off += 64) {
+                        _mm_prefetch(pf + pf_off, _MM_HINT_T0);
+                    }
+                }
+
                 // Load and convert to FP32 scale from block_q8_K
                 const __m256 row_scale_f32 = _mm256_set1_ps((a_ptr[b].d));
 

@@ -340,6 +340,49 @@ The kernel is fast; end-to-end tg is bandwidth bound, so the kernel speed is mas
 
 ---
 
+## Optimization 8: whole-block prefetch in the Q4_K GEMV (Build 31)
+
+This one applies to **Q4_K / Q4_K_M quantized models** (not Q1_0). `ggml_gemv_q4_K_8x8_q8_K()` is the
+repacked Q4_K decode kernel (`ggml/src/ggml-cpu/arch/x86/repack.cpp`) and CPU single-token generation
+spends virtually all of its time there.
+
+**Diagnosis**: it only reaches 6.0-7.5 GB/s per thread, while a plain streaming read on the same thread
+tops out at 11.6-13.1 GB/s. That gap means it is **memory-latency bound**, not bandwidth bound: the
+eight 32 B loads of one `block_q4_Kx8` (1152 B) wait for the arithmetic of the previous block, and the
+out-of-order window (~224 uops) does not cover a 200-300 cycle memory latency.
+
+**Fix**: at the top of the block loop, pull the whole block that will be consumed **two iterations
+later** (18 cache lines) into L1:
+
+```c
+{
+    const char * pf = (const char *) (b_ptr + b + 2);
+    for (size_t pf_off = 0; pf_off < sizeof(block_q4_Kx8); pf_off += 64) {
+        _mm_prefetch(pf + pf_off, _MM_HINT_T0);
+    }
+}
+```
+
+**Pitfall: do not add an `if (b + 2 < nb)` guard.** The branch inside the hot loop (or the loop
+optimisation it prevents) costs much more than the few useless prefetches at the end of the matrix -
+measured **-13%** (5.49 vs 6.34 GB/s). `PREFETCHh` never faults on an invalid address, so running past
+the end of the tensor is harmless.
+
+**Effect** (i5-10400 / 8 GB, a training job in the background, medians of interleaved in-process runs):
+
+| Metric | Before | After |
+|---|---:|---:|
+| kernel bandwidth, single thread (18 MiB matrix, DRAM resident) | 6.00-6.47 GB/s | 6.63-6.78 GB/s (**+13.0%**) |
+| end-to-end decode `tg32` (Qwen3.5-0.8B Q4_K_M, `-t 4`) | 13.66 t/s | 15.53 t/s (**+13.7%**) |
+| prefill `pp128` | 79-89 t/s | 87-89 t/s (unchanged, the GEMM path is untouched) |
+| L3 resident small matrix (0.56 MiB) | 10.07 GB/s | 10.30 GB/s (within noise) |
+
+The output is **bit-identical** to the previous kernel (`memcmp`; greedy-decoded text has the same
+md5). Measurement/reproduction: `llama.cpp-b10991/tests/bench-cpu-kern.cpp` and
+`bench/build_bench_cpu_kern.bat`.
+
+---
+
 ## Why there is no AVX-512 512-bit tile
 
 Considered and rejected:
