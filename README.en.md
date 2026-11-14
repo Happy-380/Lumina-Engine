@@ -4,7 +4,7 @@
 
 > A Windows x86-64 inference / compression / training engine built on llama.cpp b-10991: dedicated CPU kernels for **Bonsai Q1_0**, plus **Vulkan acceleration, automatic device policy, lossless compression, and QLoRA training** for a wider range of models.
 
-![Build](https://img.shields.io/badge/build-31-blue)
+![Build](https://img.shields.io/badge/build-32-blue)
 ![llama.cpp](https://img.shields.io/badge/llama.cpp-b10991-green)
 ![Platform](https://img.shields.io/badge/platform-Windows%20x86--64-lightgrey)
 ![License](https://img.shields.io/badge/license-AGPL--3.0-orange)
@@ -386,6 +386,7 @@ cmake --build build-release -j
 ```
 
 Since Build 31 the Clang build writes its binaries *directly* into `Lumina-Engine-Bin\` (see `-DCMAKE_RUNTIME_OUTPUT_DIRECTORY` in `configure-clang.bat`), so `bench\assemble_bin.bat` now only overlays the 9 MSVC CPU variants and copies the 5 runtime DLLs; without a Clang build it falls back to the MSVC base plus the backed-up variants.
+**Note: the compiler used for `ggml-cpu-*.dll` changes training numerics** (`GGML_BACKEND_DL=ON` makes the runtime pick one variant for the current CPU; MSVC and Clang emit different FP instruction sequences). To reproduce the published training numbers, use the directory assembled by `assemble_bin.bat` — see `HANDOFF.md` § Build 32.3.1.
 
 > If `D:\VulkanSDK\sdk` is detected, the build enables Vulkan automatically; otherwise it falls back to CPU-only.
 
@@ -489,11 +490,12 @@ No. The Q1_0-specific kernels only affect 1-bit models; the 14 CPU variants, Vul
 
 | Build | Highlights |
 |------:|------------|
-| **31** | Faster CPU decoding: software prefetch in the repacked Q4_K GEMV kernel, **+13%** single-token generation on CPU (bit-identical output); added a reproducible kernel-level A/B benchmark (`tests/bench-cpu-kern.cpp`) |
+| **32** | Removed the misleading `tok/s` field from the training progress line (a cumulative average that also counted fully masked prompt micro-batches and the initial disk reads; it drifted 14→26 within one run); verified Build 30/31/32 train **bit-identically** (same adapter SHA-256) |
+| 31 | Faster CPU decoding: software prefetch in the repacked Q4_K GEMV kernel, **+13%** single-token generation on CPU (bit-identical output); added a reproducible kernel-level A/B benchmark (`tests/bench-cpu-kern.cpp`) |
 | 30 | CLI multi-turn fix: empty replies are no longer stored in the chat history (root cause of MoE models answering `None` from the 2nd turn on); exit on stdin EOF instead of spinning; `[End thinking]` is now closed every turn |
 | 29 | Located the broken `--mask-history` training path (use `--no-mask-history`); loss/accuracy normalisation made explicit |
 | 28 | Long-context training feasibility confirmed; clarified the loss reporting (cumulative average) |
-| 27 | Dataset is now streamed to disk while parsing (O(1) load RAM); progress bar gained `tok/s` |
+| 27 | Dataset is now streamed to disk while parsing (O(1) load RAM); progress bar gained `tok/s` (removed again in 32) |
 | 26 | Fixed the training gradient accumulators never being cleared (key correctness bug) |
 | 25 | Qwen3.5 (qwen35 hybrid linear attention) QLoRA training support |
 | **24** | Unified startup banner across all console tools (ASCII logo + build number + project links) |

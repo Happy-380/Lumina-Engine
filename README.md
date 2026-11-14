@@ -4,7 +4,7 @@
 
 > 基于 llama.cpp b-10991 的 Windows x86-64 推理 / 压缩 / 训练引擎：为 **Bonsai Q1_0** 提供专用 CPU 内核，同时提供面向更多模型的 **Vulkan 加速、自动设备策略、无损压缩与 QLoRA 训练**。
 
-![Build](https://img.shields.io/badge/build-31-blue)
+![Build](https://img.shields.io/badge/build-32-blue)
 ![llama.cpp](https://img.shields.io/badge/llama.cpp-b10991-green)
 ![Platform](https://img.shields.io/badge/platform-Windows%20x86--64-lightgrey)
 ![License](https://img.shields.io/badge/license-AGPL--3.0-orange)
@@ -383,6 +383,7 @@ cmake --build build-release -j
 ```
 
 Build 31 起 Clang 构建直接把二进制写进 `Lumina-Engine-Bin\`（`configure-clang.bat` 里的 `-DCMAKE_RUNTIME_OUTPUT_DIRECTORY`），`bench\assemble_bin.bat` 只负责用 9 个 MSVC 变体覆盖 + 拷贝 5 个运行库；没有 Clang 构建时才回退到 MSVC 基底 + 备份变体。
+**注意：交付目录里 `ggml-cpu-*.dll` 的编译工具链会改变训练数值**（`GGML_BACKEND_DL=ON` 时运行时按 CPU 特性选一个变体，MSVC 与 Clang 的 FP 指令序列不同），复现已公布的训练数值请用 `assemble_bin.bat` 组装后的目录，详见 `HANDOFF.md` § Build 32.3.1。
 
 > 构建时若检测到 `D:\VulkanSDK\sdk` 会自动启用 Vulkan，未安装则自动回退 CPU-only。
 
@@ -487,11 +488,12 @@ Lumina-Engine/
 
 | Build | 主要内容 |
 |------:|----------|
-| **31** | CPU 解码提速：repack 后的 Q4_K GEMV 内核加软件预取，纯 CPU 单 token 生成 **+13%**（输出逐位不变）；新增可复现的内核级 A/B 基准 `tests/bench-cpu-kern.cpp` |
+| **32** | 训练进度条去掉不准的 `tok/s`（它是整趟累计平均，掺了全掩码 prompt 微批与开头读盘，同一次训练内能从 14 漂到 26）；顺带复核 Build 30/31/32 训练结果**逐位一致**（同一命令适配器 SHA-256 相同） |
+| 31 | CPU 解码提速：repack 后的 Q4_K GEMV 内核加软件预取，纯 CPU 单 token 生成 **+13%**（输出逐位不变）；新增可复现的内核级 A/B 基准 `tests/bench-cpu-kern.cpp` |
 | 30 | CLI 多轮对话修复：空回复不再写入历史（MoE 从第二轮起只回 `None` 的根因）；stdin 关闭 / EOF 时退出而不是死循环；每轮闭合 `[End thinking]` |
 | 29 | `--mask-history` 训练路径损坏定位（训练改用 `--no-mask-history`）+ loss/accuracy 归一化口径显式化 |
 | 28 | 长上下文训练可行性确认；loss 显示口径说明（累计均值） |
-| 27 | 数据集改为边解析边落盘（加载峰值内存 O(1)），进度条加 `tok/s` |
+| 27 | 数据集改为边解析边落盘（加载峰值内存 O(1)），进度条加 `tok/s`（Build 32 已移除） |
 | 26 | 修复训练梯度累加器从不清零（loss 线性攀升的关键正确性问题） |
 | 25 | Qwen3.5（qwen35 混合线性注意力）QLoRA 训练支持 |
 | **24** | 所有控制台工具统一启动画面（ASCII logo + Build 号 + 项目链接） |

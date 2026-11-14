@@ -9,7 +9,25 @@
 
 ---
 
-## Build 31（本次）：Q4_K GEMV 软件预取 —— CPU 解码吞吐 +13%
+## Build 32（本次）：训练进度条去掉 `tok/s`（口径不准） —— 并复核 30/31/32 训练等价
+
+**背景**：Build 27 在训练进度条末尾加了 `%5.1f tok/s`。它按 `tokens = ibatch * n_ubatch` 除以
+**整趟累计**耗时算，于是：① 是累计平均而非瞬时速度，开头读盘把均值永久压低；
+② 分子把全掩码 prompt 微批（`loss=0`、一次 ubatch 只出 1 行 loss）的 token 也算进去；
+③ 有后台负载时同一次训练里能从 14.4 漂到 26.4。**结论：这个数没有比较价值，删掉**，
+进度条只留 `loss` / `acc` / `t=` / `ETA=`；吞吐比较改用「固定 token 预算 + 外部掐表」。
+
+| 项 | 内容 |
+| --- | --- |
+| 改动文件 | `ggml/src/ggml-opt.cpp`（删 `t_tokens` / `t_tokens_per_s` / 格式串字段）、`CMakeLists.txt`（31→32）、`tools/rpc/rpc-server.cpp`（31→32） |
+| 数值影响 | **无**。等价性：同一小样本命令（1,144 tokens / 8 微批 / 4 线程 / `-lr 1e-4`）下 30、31、32 三版**适配器 SHA-256 完全相同**（`04690bf8…69bd72`），逐步 loss 逐位相同 |
+| 顺带发现的坑 | 只把 `build-clang` 产物放进 `Lumina-Engine-Bin`（不经 `assemble_bin.bat` 覆盖 9 个 MSVC 变体）会**改变训练数值**：首微批 loss 2.91478 → 2.94094。`GGML_BACKEND_DL=ON` 下运行时选中的 `ggml-cpu-<variant>.dll` 的编译器决定 FP 指令序列。复现公布数值必须用组装后的交付目录 |
+| 交付 | 两棵树重编（Clang 14 变体 + Vulkan / MSVC 9 变体）→ `assemble_bin.bat` → **55 文件**，`--version` = `build 32` |
+| 文档 | `HANDOFF.md` § Build 32、`README(.en).md`、`TRAINING_PIPELINE.md`、`KAGGLE_TEST.md`、`wiki/Changes(.en).md` |
+
+---
+
+## Build 31（历史）：Q4_K GEMV 软件预取 —— CPU 解码吞吐 +13%
 
 **背景**：CPU 单 token 生成的时间几乎全部花在量化 GEMV 内核上（`ggml_gemv_q4_K_8x8_q8_K`，
 即 repack 后的 Q4_K×8 内核）。本机（i5-10400 / 6C12T / DDR4 / 8 GB）实测该内核单线程只能跑到

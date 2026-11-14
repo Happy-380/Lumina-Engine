@@ -1,7 +1,7 @@
 # Lumina-Engine 三段式训练流程（Stage1 → Stage2 → Stage3）
 
 > 适用：`SmallThinker-4BA0.6B-Instruct`（MoE）QLoRA 三阶段微调
-> 工具：`Lumina-Engine-Bin\Lumina-Engine-train.exe`（Build 31）
+> 工具：`Lumina-Engine-Bin\Lumina-Engine-train.exe`（Build 32）
 >
 > **Build 30 起：本文所有示例命令已显式加 `--no-mask-history`。** 另外两点来自 Build 30 的命令复核：
 > ① 8 GB 机器上默认 LoRA targets 会被**静默缩减**（MoE 专家 FFN `ffn_up/ffn_down` 被丢掉，只留
@@ -19,7 +19,8 @@
 > （`-c 8192` 实测 23.9 tok/s，推理 PPL 随上下文变长而下降）。
 > **Build 27 起：数据集是「边解析边落盘」的（磁盘流式）。** 加载阶段不再把整份语料累计到内存，
 > 峰值内存从 5 B/token 降为 O(一个记录)，因此 `--dataset` 可以指向远超物理内存的语料；
-> 进度条每行末尾新增 `tok/s` 实时吞吐。临时文件写到 `%TEMP%\lumina-train\<tag>-<pid>\`，
+> ~~进度条每行末尾新增 `tok/s` 实时吞吐。~~ **Build 32 已移除**：那是整趟累计平均（掺全掩码 prompt 微批 + 开头读盘），同一次训练内可从 14 漂到 26，不能用来比较配置；比吞吐请固定 token 预算 + 外部掐表。
+> **Build 32 另发现**：训练数值取决于运行时加载的 `ggml-cpu-<variant>.dll` —— 用 `assemble_bin.bat` 组装后的交付目录（Clang 基底 + MSVC 变体）才能复现已公布的数值，详见 `HANDOFF.md` § Build 32.3.1。临时文件写到 `%TEMP%\lumina-train\<tag>-<pid>\`，
 > 同一台机器上并发跑两个训练不会互相覆盖（Build 26 会）。其余参数与产物格式不变。
 >
 > Build 20 起训练已支持长上下文低内存：注意力反向现场重算 + 数据集内存映射，

@@ -1301,19 +1301,10 @@ void ggml_opt_epoch_callback_progress_bar(
     const int64_t t_eta_m = t_eta_s / 60;
     t_eta_s -= t_eta_m * 60;
 
-    // Build 27: average throughput of this pass (tokens = micro-batches * physical batch).
-    // Useful to compare configurations without waiting for the ETA to converge.
-    const int64_t t_tokens = ibatch * n_ubatch;
-    const double  t_tokens_per_s = (t_ibatch_us > 0 && t_tokens > 0)
-                                 ? (double) t_tokens * 1e6 / (double) t_ibatch_us
-                                 : 0.0;
-
     fprintf(stderr, "] data=%07" PRId64 "/%07" PRId64 " %s %s "
-            "t=%02" PRId64 ":%02" PRId64 ":%02" PRId64 " ETA=%02" PRId64 ":%02" PRId64 ":%02" PRId64 " "
-            "%5.1f tok/s \r",
+            "t=%02" PRId64 ":%02" PRId64 ":%02" PRId64 " ETA=%02" PRId64 ":%02" PRId64 ":%02" PRId64 " \r",
             idata, idata_max, loss_str, acc_str,
-            t_ibatch_h, t_ibatch_m, t_ibatch_s, t_eta_h, t_eta_m, t_eta_s,
-            t_tokens_per_s);
+            t_ibatch_h, t_ibatch_m, t_ibatch_s, t_eta_h, t_eta_m, t_eta_s);
     if (ibatch == ibatch_max) {
         fprintf(stderr, "\n");
     }

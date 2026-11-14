@@ -1,3 +1,25 @@
+## 0. Training progress bar loses `tok/s` (Build 32)
+
+Build 27 appended a live throughput field `%5.1f tok/s` to the training progress line. It was a
+**cumulative average over the whole pass**: the first micro-batches spend their time on disk reads and
+cache building, permanently dragging the average down; the numerator also counted the tokens of
+**fully masked prompt micro-batches** (`loss=0`, one loss row per ubatch); and with background load the
+number drifted from 14.4 to 26.4 *within one run*. Build 32 removes it — the progress line keeps only
+`loss` / `acc` / elapsed `t=` / `ETA=`:
+
+```text
+train: [███████▉] data=0000008/0000008 loss=1.94035±0.22760 acc=58.20±2.18%   t=00:01:05 ETA=00:00:00
+```
+
+To compare throughput, use a fixed token budget plus an external stopwatch (or `--dataset-limit` for a
+short run of equal size); see the throughput table in `TRAINING_PIPELINE.md`.
+
+The change touches only the `fprintf` in `ggml/src/ggml-opt.cpp` (no arithmetic), so **training is
+bit-identical to Build 30/31**: for the same small-sample command all three builds produce the adapter
+SHA-256 `04690bf8…69bd72` (details in `HANDOFF.md` § Build 32).
+
+---
+
 # Main Code Changes
 
 > 🌐 [中文](Changes.md) | **English**
@@ -9,7 +31,7 @@ only the `GGML_TYPE_Q1_0` + AVX2 path; on top of that there is the Q4_K decode-k
 
 ---
 
-## 0. Q4_K GEMV software prefetch (Build 31)
+## 0.1 Q4_K GEMV software prefetch (Build 31)
 
 CPU single-token generation spends almost all of its time in `ggml_gemv_q4_K_8x8_q8_K` (the repacked
 Q4_K decode kernel). On this machine that kernel only reaches 6.0-7.5 GB/s per thread while a plain
@@ -42,7 +64,7 @@ Correctness: the patched kernel produces **bit-identical** output to the previou
 greedy decoding (`--temp 0`) of the real engine yields exactly the same text as Build 30; all 7
 experimental variants match an independent scalar reference (`max_abs_err = 4.8e-07`, tolerance 2.9e-06).
 
-## 0.1 CLI multi-turn fix (Build 30)
+## 0.2 CLI multi-turn fix (Build 30)
 
 MoE chat answered `None` from the 2nd turn on: the CLI unconditionally appended the assistant message
 (possibly an empty string) to its history, so a turn that produced no visible output left a dangling
@@ -59,7 +81,7 @@ strict MoE chat templates made the model emit a placeholder token for good. Also
 Measured: `printf '你好\n1+1=?\n' | cli` produced an endless `> ` stream on Build 29
 (1,483,183 lines in 300 s) and exits normally with `Exiting...` (37 lines, exit 0) on Build 30.
 
-## 0.2 `--mask-history` training-path issue + normalisation (Build 29)
+## 0.3 `--mask-history` training-path issue + normalisation (Build 29)
 
 Measured: same token stream, `-c 4096`, per-batch loss ~11.9 with `--mask-history` vs ~1.47 with
 `--no-mask-history` (two runs each, bit-identical; labels verified correct; inference PPL of the same
@@ -72,7 +94,7 @@ text is 2.03). **Train with `--no-mask-history`.**
 | `tools/lumina-train/lumina-train.cpp` | modified | note about the `--mask-history` path and the recommended configuration |
 | `CMakeLists.txt` / `tools/rpc/rpc-server.cpp` | modified | Build 28 -> 29 |
 
-## 0.3 Training-loss reporting note (Build 28)
+## 0.4 Training-loss reporting note (Build 28)
 
 The progress-bar loss is a cumulative mean; the CE kernel averages over all rows while
 `ggml_opt_result_loss()` compensates with `ndata/nlabeled` (dataset points vs labelled rows - different
@@ -85,7 +107,7 @@ judge progress with `--dataset-val`.
 | `tools/lumina-train/lumina-train.cpp` | modified | removed the incorrect `-c > 2048` warning; added the `--mask-history` note |
 | `CMakeLists.txt` / `tools/rpc/rpc-server.cpp` | modified | Build 27 -> 28 |
 
-## 0.4 Disk-backed training dataset (Build 27)
+## 0.5 Disk-backed training dataset (Build 27)
 
 The trainer used to accumulate the entire dataset in two `std::vector`s
 (`int32` token ids + `uint8` trainability mask = **5 bytes per token**) and only then serialise it
@@ -108,7 +130,7 @@ byte-identical data:
 | Build 26 | 2074 MB | 29282 rec / 300,021,789 tok / 278,340 datapoints |
 | Build 27 | **645 MB** | identical |
 
-## 0.5 Training gradient-accumulator fix (Build 26)
+## 0.6 Training gradient-accumulator fix (Build 26)
 
 For the `llama-finetune` / `llama_opt_epoch()` path (`Lumina-Engine-train`) with
 `n_batch / n_ubatch > 1`, the old code never cleared the gradient accumulators: every optimizer
@@ -128,7 +150,7 @@ grew without bound and the loss climbed (approximately linearly).
 
 ---
 
-## 0.6 Unified console startup screen (Build 24)
+## 0.7 Unified console startup screen (Build 24)
 
 Every console tool now prints the same Lumina-Engine startup screen (ASCII logo + build number +
 project links):

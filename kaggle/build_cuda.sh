@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ---------------------------------------------------------------------------
-# Build Lumina-Engine (llama.cpp b-10991 fork, Build 31) on Linux / Kaggle.
+# Build Lumina-Engine (llama.cpp b-10991 fork, Build 32) on Linux / Kaggle.
 #
 #   - CUDA backend ON (falls back to a CPU-only build if the CUDA toolchain is
 #     missing or the CUDA configure step fails, so training can always start)

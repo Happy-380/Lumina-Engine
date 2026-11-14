@@ -1,3 +1,22 @@
+## 0. 训练进度条去掉 `tok/s`（Build 32）
+
+Build 27 在训练进度条末尾加了实时吞吐 `%5.1f tok/s`，但它是**整趟累计平均值**：开头读盘 / 建缓存会把均值
+永久压低；分子还把**全掩码 prompt 微批**（`loss=0`，一次 ubatch 只出 1 行 loss）的 token 算进去；
+有后台负载时同一次训练内能从 14.4 漂到 26.4。因此 Build 32 把它删掉，进度条只保留
+`loss` / `acc` / `t=` / `ETA=`：
+
+```text
+train: [███████▉] data=0000008/0000008 loss=1.94035±0.22760 acc=58.20±2.18%   t=00:01:05 ETA=00:00:00
+```
+
+要比较吞吐请用「固定 token 预算 + 外部掐表」（或 `--dataset-limit` 跑等规模短跑），见
+`TRAINING_PIPELINE.md` 的吞吐表。
+
+改动只有 `ggml/src/ggml-opt.cpp` 里的打印（不参与算术），因此**训练数值与 Build 30/31 逐位一致**：
+同一小样本命令下三版适配器 SHA-256 均为 `04690bf8…69bd72`（详见 `HANDOFF.md` § Build 32）。
+
+---
+
 # 主要代码更改
 
 > 🌐 **中文** | [English](Changes.en.md)
@@ -7,7 +26,7 @@
 
 ---
 
-## 0. CPU Q4_K GEMV 软件预取（Build 31）
+## 0.1 CPU Q4_K GEMV 软件预取（Build 31）
 
 纯 CPU 单 token 生成的时间几乎全在 `ggml_gemv_q4_K_8x8_q8_K`（repack 后的 Q4_K 解码内核）上。
 本机实测该内核单线程只有 6.0–7.5 GB/s，而同一线程纯流式读上限是 11.6–13.1 GB/s —— 说明瓶颈是
@@ -36,7 +55,7 @@ cache line）整块 `_mm_prefetch` 进 L1。**不要加 `if (b + 2 < nb)` 边界
 正确性：改后内核输出与改前 **逐位相同**（`memcmp`）；真实引擎贪心解码（`--temp 0`）生成文本与
 Build 30 完全一致；7 个实验变体对独立标量参考 `max_abs_err = 4.8e-07`（容差 2.9e-06）。
 
-## 0.1 CLI 多轮对话修复（Build 30）
+## 0.2 CLI 多轮对话修复（Build 30）
 
 MoE 模型对话时第二轮及之后只回 `None`：CLI 每轮无条件把 assistant 消息（content 可能为空串）追加进
 历史，一旦某轮没有可见输出，这条空 assistant 轮就永久留在历史里，后续请求变成
@@ -52,7 +71,7 @@ MoE 模型对话时第二轮及之后只回 `None`：CLI 每轮无条件把 assi
 实测：`printf '你好\n1+1=?\n' | cli` 在 Build 29 下会持续输出 `> `（300 s / 1,483,183 行），
 Build 30 正常两轮后 `Exiting...`（37 行，exit 0）。
 
-## 0.2 `--mask-history` 训练路径问题 + 归一化口径（Build 29）
+## 0.3 `--mask-history` 训练路径问题 + 归一化口径（Build 29）
 
 实测：同一 token 流、`-c 4096`，`--mask-history` 的每批 loss ≈ 11.9，`--no-mask-history` ≈ 1.47
 （各跑两次逐位一致；标签核对无误；推理侧同文本 PPL 2.03）。**训练请改用 `--no-mask-history`。**
@@ -64,7 +83,7 @@ Build 30 正常两轮后 `Exiting...`（37 行，exit 0）。
 | `tools/lumina-train/lumina-train.cpp` | 修改 | 提示 `--mask-history` 的路径问题与推荐配置 |
 | `CMakeLists.txt` / `tools/rpc/rpc-server.cpp` | 修改 | Build 28 → 29 |
 
-## 0.3 训练 loss 显示口径说明（Build 28）
+## 0.4 训练 loss 显示口径说明（Build 28）
 
 进度条 loss 是累计均值；CE 核按全部行求均值，而 `ggml_opt_result_loss()` 的补偿项
 `ndata/nlabeled` 用「数据集点数 / 已标注行数」（单位不一致）→ 已标注行很少时读数被放大约 8 倍
@@ -76,7 +95,7 @@ Build 30 正常两轮后 `Exiting...`（37 行，exit 0）。
 | `tools/lumina-train/lumina-train.cpp` | 修改 | 删除 `-c > 2048` 告警（结论有误）；新增 `--mask-history` 口径说明 |
 | `CMakeLists.txt` / `tools/rpc/rpc-server.cpp` | 修改 | Build 27 → 28 |
 
-## 0.4 训练数据集磁盘流式落盘（Build 27）
+## 0.5 训练数据集磁盘流式落盘（Build 27）
 
 `Lumina-Engine-train` 加载 `--dataset` 时，旧实现把整份语料追加进两个 `std::vector`
 （`int32` token ids + `uint8` 可训练掩码 = **5 B/token**），加载完成后才序列化成临时文件再 mmap。
@@ -97,7 +116,7 @@ Build 30 正常两轮后 `Exiting...`（37 行，exit 0）。
 | Build 26 | 2074 MB | 29282 rec / 300,021,789 tok / 278,340 datapoints |
 | Build 27 | **645 MB** | 完全相同 |
 
-## 0.5 训练梯度累加器修复（Build 26）
+## 0.6 训练梯度累加器修复（Build 26）
 
 `llama-finetune` / `llama_opt_epoch()` 路径（`Lumina-Engine-train`）在
 `n_batch / n_ubatch > 1` 时，旧代码的梯度累加器从未清零：每个优化器步实际应用的是
@@ -115,7 +134,7 @@ Build 30 正常两轮后 `Exiting...`（37 行，exit 0）。
 
 ---
 
-## 0.6 控制台统一启动画面（Build 24）
+## 0.7 控制台统一启动画面（Build 24）
 
 所有控制台工具启动时打印同一套 Lumina-Engine 启动画面（ASCII logo + Build 号 + 项目链接）：
 
