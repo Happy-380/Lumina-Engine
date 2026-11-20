@@ -1203,6 +1203,179 @@ void llama_model_base::load_stats(llama_model_loader & ml) {
     pimpl->n_bytes = ml.n_bytes;
 }
 
+// --- prism.hadamard.* metadata (see llama_prism_hadamard) -------------------
+// These helpers deliberately use the raw gguf API: the keys are not part of the
+// llama.cpp key enum because they come from the PrismML quantization toolchain.
+static int64_t gguf_kv_i64(const gguf_context * ctx, const char * key, int64_t def) {
+    const int kid = gguf_find_key(ctx, key);
+    if (kid < 0) {
+        return def;
+    }
+
+    switch (gguf_get_kv_type(ctx, kid)) {
+        case GGUF_TYPE_UINT8:  return (int64_t) gguf_get_val_u8 (ctx, kid);
+        case GGUF_TYPE_INT8:   return (int64_t) gguf_get_val_i8 (ctx, kid);
+        case GGUF_TYPE_UINT16: return (int64_t) gguf_get_val_u16(ctx, kid);
+        case GGUF_TYPE_INT16:  return (int64_t) gguf_get_val_i16(ctx, kid);
+        case GGUF_TYPE_UINT32: return (int64_t) gguf_get_val_u32(ctx, kid);
+        case GGUF_TYPE_INT32:  return (int64_t) gguf_get_val_i32(ctx, kid);
+        case GGUF_TYPE_UINT64: return (int64_t) gguf_get_val_u64(ctx, kid);
+        case GGUF_TYPE_INT64:  return          gguf_get_val_i64(ctx, kid);
+        case GGUF_TYPE_BOOL:   return gguf_get_val_bool(ctx, kid) ? 1 : 0;
+        default:               return def;
+    }
+}
+
+static bool gguf_kv_bool(const gguf_context * ctx, const char * key, bool def) {
+    return gguf_kv_i64(ctx, key, def ? 1 : 0) != 0;
+}
+
+static std::string gguf_kv_str(const gguf_context * ctx, const char * key, const char * def) {
+    const int kid = gguf_find_key(ctx, key);
+    if (kid < 0 || gguf_get_kv_type(ctx, kid) != GGUF_TYPE_STRING) {
+        return def;
+    }
+    return gguf_get_val_str(ctx, kid);
+}
+
+static bool gguf_kv_i64_arr(const gguf_context * ctx, const char * key, std::vector<int64_t> & out) {
+    const int kid = gguf_find_key(ctx, key);
+    if (kid < 0 || gguf_get_kv_type(ctx, kid) != GGUF_TYPE_ARRAY) {
+        return false;
+    }
+
+    const enum gguf_type at = gguf_get_arr_type(ctx, kid);
+    const int64_t n = (int64_t) gguf_get_arr_n(ctx, kid);
+    const void * data = gguf_get_arr_data(ctx, kid);
+
+    out.resize(n);
+
+    switch (at) {
+        case GGUF_TYPE_UINT8:  for (int64_t i = 0; i < n; ++i) out[i] = ((const uint8_t  *) data)[i]; break;
+        case GGUF_TYPE_INT8:   for (int64_t i = 0; i < n; ++i) out[i] = ((const int8_t   *) data)[i]; break;
+        case GGUF_TYPE_UINT16: for (int64_t i = 0; i < n; ++i) out[i] = ((const uint16_t *) data)[i]; break;
+        case GGUF_TYPE_INT16:  for (int64_t i = 0; i < n; ++i) out[i] = ((const int16_t  *) data)[i]; break;
+        case GGUF_TYPE_UINT32: for (int64_t i = 0; i < n; ++i) out[i] = ((const uint32_t *) data)[i]; break;
+        case GGUF_TYPE_INT32:  for (int64_t i = 0; i < n; ++i) out[i] = ((const int32_t  *) data)[i]; break;
+        case GGUF_TYPE_UINT64: for (int64_t i = 0; i < n; ++i) out[i] = (int64_t) ((const uint64_t *) data)[i]; break;
+        case GGUF_TYPE_INT64:  for (int64_t i = 0; i < n; ++i) out[i] = ((const int64_t  *) data)[i]; break;
+        default:               out.clear(); return false;
+    }
+
+    return true;
+}
+
+static bool gguf_kv_str_arr(const gguf_context * ctx, const char * key, std::vector<std::string> & out) {
+    const int kid = gguf_find_key(ctx, key);
+    if (kid < 0 || gguf_get_kv_type(ctx, kid) != GGUF_TYPE_ARRAY) {
+        return false;
+    }
+    if (gguf_get_arr_type(ctx, kid) != GGUF_TYPE_STRING) {
+        return false;
+    }
+
+    const int64_t n = (int64_t) gguf_get_arr_n(ctx, kid);
+
+    out.resize(n);
+    for (int64_t i = 0; i < n; ++i) {
+        out[i] = gguf_get_arr_str(ctx, kid, i);
+    }
+
+    return true;
+}
+
+// Parse the optional "prism.hadamard.*" block. Anything unexpected disables the
+// feature (with a warning) instead of throwing, so models that do not use it are
+// not affected in any way.
+static void llama_load_prism_hadamard(const gguf_context * ctx, llama_prism_hadamard & prism) {
+    prism = llama_prism_hadamard();
+
+    if (gguf_find_key(ctx, "prism.hadamard.version") < 0) {
+        return;
+    }
+
+    const int64_t version     = gguf_kv_i64(ctx, "prism.hadamard.version", 0);
+    const int64_t block_size  = gguf_kv_i64(ctx, "prism.hadamard.block_size", 0);
+    const bool    tied_output = gguf_kv_bool(ctx, "prism.hadamard.tied_output", false);
+    const std::string transform = gguf_kv_str(ctx, "prism.hadamard.transform", "");
+    const std::string axis      = gguf_kv_str(ctx, "prism.hadamard.axis",      "");
+    const std::string sign_mode = gguf_kv_str(ctx, "prism.hadamard.sign_mode", "");
+
+    std::vector<int64_t> sign_widths;
+    std::vector<int64_t> sign_values;
+    std::vector<std::string> weight_names;
+    std::vector<std::string> inverse_names;
+
+    gguf_kv_i64_arr(ctx, "prism.hadamard.sign_widths",        sign_widths);
+    gguf_kv_i64_arr(ctx, "prism.hadamard.sign_values",        sign_values);
+    gguf_kv_str_arr(ctx, "prism.hadamard.weight_names",       weight_names);
+    gguf_kv_str_arr(ctx, "prism.hadamard.inverse_weight_names", inverse_names);
+
+    auto reject = [&](const char * why) {
+        LLAMA_LOG_WARN("%s: unsupported prism.hadamard metadata (%s) - the rotation will not be applied\n", __func__, why);
+    };
+
+    if (transform != "normalized-sylvester-walsh-hadamard") {
+        reject("transform");
+        return;
+    }
+    if (axis != "input-last-dimension") {
+        reject("axis");
+        return;
+    }
+    if (sign_mode != "explicit") {
+        reject("sign_mode");
+        return;
+    }
+    if (block_size <= 0 || (block_size & (block_size - 1)) != 0) {
+        reject("block_size");
+        return;
+    }
+    if (sign_widths.empty()) {
+        reject("sign_widths");
+        return;
+    }
+
+    int64_t n_signs = 0;
+    for (const int64_t w : sign_widths) {
+        if (w <= 0 || w % block_size != 0) {
+            reject("sign_widths (not a multiple of block_size)");
+            return;
+        }
+        n_signs += w;
+    }
+    if (n_signs != (int64_t) sign_values.size()) {
+        reject("sign_values (length mismatch)");
+        return;
+    }
+
+    size_t off = 0;
+    for (const int64_t w : sign_widths) {
+        std::vector<float> signs(w);
+        for (int64_t i = 0; i < w; ++i) {
+            signs[i] = sign_values[off + i] < 0 ? -1.0f : 1.0f;
+        }
+        prism.signs[w] = std::move(signs);
+        off += w;
+    }
+
+    prism.enabled     = true;
+    prism.tied_output = tied_output;
+    prism.block_size  = block_size;
+    prism.fwd = std::set<std::string>(weight_names.begin(),   weight_names.end());
+    prism.inv = std::set<std::string>(inverse_names.begin(),  inverse_names.end());
+
+    std::string widths_str;
+    for (const int64_t w : sign_widths) {
+        widths_str += (widths_str.empty() ? "" : "/") + std::to_string(w);
+    }
+
+    LLAMA_LOG_INFO("%s: prism.hadamard v%lld: block = %lld, sign widths = %s, "
+            "rotated weights = %zu, inverse weights = %zu, tied output = %d\n",
+            __func__, (long long) version, (long long) block_size, widths_str.c_str(),
+            prism.fwd.size(), prism.inv.size(), prism.tied_output ? 1 : 0);
+}
+
 void llama_model_base::load_hparams(llama_model_loader & ml) {
     const gguf_context * ctx = ml.metadata;
 
@@ -1219,6 +1392,15 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
 
     // get general kv
     ml.get_key(LLM_KV_GENERAL_NAME, name, false);
+
+    // optional PrismML incoherence rotation (Ternary Bonsai and similar models)
+    llama_load_prism_hadamard(ctx, prism);
+
+    if (prism.enabled &&
+            arch != LLM_ARCH_QWEN35 && arch != LLM_ARCH_QWEN35MOE) {
+        LLAMA_LOG_WARN("%s: prism.hadamard metadata is only applied by the qwen35/qwen35moe graphs - "
+                "arch %s will produce garbage\n", __func__, llm_arch_name(arch));
+    }
 
     // everything past this point is not vocab-related
     // for CLIP models, we only need to load tensors, no hparams

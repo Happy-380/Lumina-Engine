@@ -106,16 +106,17 @@ Comet Lake 不支持 AVX-512 / VNNI，因此选择 `haswell`（AVX2）。
 ```
 Lumina-Engine-Bin/
 ├─ 14 × ggml-cpu-*.dll
-├─ ggml-base.dll  ggml.dll  ggml-rpc.dll
+├─ ggml-base.dll  ggml.dll  ggml-rpc.dll  ggml-vulkan.dll
 ├─ Lumina-Engine.dll  Lumina-Engine-common.dll  mtmd.dll
-├─ 20 × Lumina-Engine-*.exe
+├─ 20 × Lumina-Engine-*.exe  +  ggml-rpc-server.exe
 ├─ 8 × *-impl.dll
 ├─ libomp140.x86_64.dll   (Clang 后端/工具)
 ├─ vcomp140.dll           (MSVC 后端)
 └─ msvcp140.dll  vcruntime140.dll  vcruntime140_1.dll
 ```
 
-共 53 个文件。直接整体拷贝即可在任意兼容 Windows x86-64 机器上运行。
+共 **55** 个文件（21 exe + 8 impl + 14 CPU 变体 + 4 ggml DLL + 3 引擎 DLL + 5 运行库）。
+直接整体拷贝即可在任意兼容 Windows x86-64 机器上运行。
 
 ---
 
@@ -127,3 +128,25 @@ Lumina-Engine-Bin/
 - 本机为**单通道内存**，tg 受带宽上限约束（理论 ~15.7 tok/s）；双通道/更高带宽平台上 tg 提升更接近内核层面。
 - 需要约 0.95 GiB 额外内存存放置换后的权重；首次使用有约 0.7 s 的一次性填充。
 - 关闭后行为与改动前完全一致。
+
+---
+
+## 9. 模型格式与量化类型支持
+
+| 项目 | 支持情况 |
+|------|----------|
+| 量化类型 | `Q1_0`（Bonsai 1-bit，专用内核）、`Q2_0` / `TQ2_0`（三元）、`Q4_K` / `Q6_K`、`Q4_0` / `Q5_0` / `Q8_0`、`MXFP4` / `NVFP4`、`IQ*` 系列等（CPU / Vulkan / CUDA 后端按各自支持表） |
+| 架构 | `qwen35` / `qwen35moe` 等全部上游架构；`qwen35` 额外支持 M-RoPE 与 mmproj 多模态 |
+| PrismML 旋转权重 | **Build 33 起支持**：GGUF 带 `prism.hadamard.*` 元数据时自动读出分块 512 归一化 Sylvester–Hadamard + ±1 符号，并在推理时对激活做对应旋转（`Ternary-Bonsai-2-2B-Q2_0` 实测通过） |
+| PrismML mmproj | `qwen3vl_merger` 投影（`Ternary-Bonsai-2-2B-mmproj-Q8_0`）用 `Lumina-Engine-mtmd-cli` 加载；视觉向量走原始 embedding 分支，**不做**旋转 |
+
+- 无 `prism.hadamard.*` 元数据的模型行为完全不变（相关代码全部按元数据关闭）。
+- 只支持元数据里写明的三种取值：`transform = normalized-sylvester-walsh-hadamard`、
+  `axis = input-last-dimension`、`sign_mode = explicit`；其它取值只告警并**忽略**旋转（不会崩）。
+- 旋转复用 FWHT 快速路径（CPU / Vulkan / CUDA / Metal / SYCL）；不支持 `GGML_HINT_SRC0_IS_HADAMARD`
+  的后端退化为真实矩阵乘，结果相同但更慢。
+- 排障开关：`LUMINA_PRISM_DISABLE=1`（完全关闭）、`LUMINA_PRISM_ORDER=hd|dh`、
+  `LUMINA_PRISM_EMBD=inv|fwd|none`、`LUMINA_PRISM_OUT=fwd|inv|none`、`LUMINA_PRISM_NO_FWHT=1`
+  （改用真实矩阵乘）、`LUMINA_PRISM_DEBUG=1`（打印旋转书签，需 `-v`）、`LUMINA_NO_FUSED_GDN=1`。
+- 验收要点：**批处理困惑度正常不代表自回归生成正常** —— 必须同时比较 `-ub 512` 与 `-ub 1` 的生成结果，
+  并用 `perplexity -b 1` 确认不出现 `nan`。

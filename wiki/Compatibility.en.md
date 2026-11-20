@@ -109,16 +109,17 @@ loaded, check the `Lumina-Engine-cli` startup log or the `backend` column of `Lu
 ```
 Lumina-Engine-Bin/
 ├─ 14 × ggml-cpu-*.dll
-├─ ggml-base.dll  ggml.dll  ggml-rpc.dll
+├─ ggml-base.dll  ggml.dll  ggml-rpc.dll  ggml-vulkan.dll
 ├─ Lumina-Engine.dll  Lumina-Engine-common.dll  mtmd.dll
-├─ 20 × Lumina-Engine-*.exe
+├─ 20 × Lumina-Engine-*.exe  +  ggml-rpc-server.exe
 ├─ 8 × *-impl.dll
 ├─ libomp140.x86_64.dll   (Clang backends/tools)
 ├─ vcomp140.dll           (MSVC backends)
 └─ msvcp140.dll  vcruntime140.dll  vcruntime140_1.dll
 ```
 
-53 files in total. Copy the whole folder to any compatible Windows x86-64 machine and run.
+**55** files in total (21 exe + 8 impl + 14 CPU variants + 4 ggml DLLs + 3 engine DLLs + 5 runtimes).
+Copy the whole folder to any compatible Windows x86-64 machine and run.
 
 ---
 
@@ -134,3 +135,26 @@ Lumina-Engine-Bin/
   on dual-channel / higher-bandwidth platforms the tg gain approaches the kernel-level value.
 - Needs ~0.95 GiB extra memory for the permuted weights and a one-time fill of ~0.7 s on first use.
 - When disabled, behavior is identical to before the changes.
+
+---
+
+## 9. Model formats and quantization types
+
+| Item | Support |
+|------|---------|
+| Quantization | `Q1_0` (Bonsai 1-bit, dedicated kernels), `Q2_0` / `TQ2_0` (ternary), `Q4_K` / `Q6_K`, `Q4_0` / `Q5_0` / `Q8_0`, `MXFP4` / `NVFP4`, `IQ*`, ... (per-backend support tables) |
+| Architectures | All upstream architectures including `qwen35` / `qwen35moe`; `qwen35` also supports M-RoPE and mmproj multimodal input |
+| PrismML rotated weights | **Supported since Build 33**: when the GGUF carries `prism.hadamard.*` metadata the engine reads the block-512 normalized Sylvester-Hadamard plus explicit +/-1 signs and rotates the activations accordingly (`Ternary-Bonsai-2-2B-Q2_0` verified) |
+| PrismML mmproj | `qwen3vl_merger` projectors (`Ternary-Bonsai-2-2B-mmproj-Q8_0`) load with `Lumina-Engine-mtmd-cli`; the vision vectors use the raw embedding branch and are **not** rotated |
+
+- Models without `prism.hadamard.*` metadata behave exactly as before (all of that code is gated).
+- Only the documented values are accepted (`transform = normalized-sylvester-walsh-hadamard`,
+  `axis = input-last-dimension`, `sign_mode = explicit`); anything else only warns and **skips** the
+  rotation (never aborts).
+- The rotation reuses the FWHT fast path (CPU / Vulkan / CUDA / Metal / SYCL); backends without
+  `GGML_HINT_SRC0_IS_HADAMARD` fall back to a plain matrix product - same result, slower.
+- Debug switches: `LUMINA_PRISM_DISABLE=1`, `LUMINA_PRISM_ORDER=hd|dh`, `LUMINA_PRISM_EMBD=inv|fwd|none`,
+  `LUMINA_PRISM_OUT=fwd|inv|none`, `LUMINA_PRISM_NO_FWHT=1` (plain matmul instead of FWHT),
+  `LUMINA_PRISM_DEBUG=1` (rotation bookkeeping, needs `-v`), `LUMINA_NO_FUSED_GDN=1`.
+- Acceptance note: **batched perplexity being fine does not prove generation is fine** - always compare
+  the generated text for `-ub 512` vs `-ub 1` and check that `perplexity -b 1` does not return `nan`.

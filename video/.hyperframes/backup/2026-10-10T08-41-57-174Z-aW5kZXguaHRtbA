@@ -1,0 +1,274 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=1920, height=1080" />
+    <title>Lumina Engine — 功能介绍</title>
+    <script src="vendor/gsap.min.js"></script>
+    <style>
+      :root {
+        --bg: #05080e;
+        --ink: #eef2fc;
+        --muted: #9aadca;
+        --cyan: #67D4FF;
+        --blue: #F2BAFF;
+        --violet: #F2BAFF;
+        --line: rgba(120, 160, 220, 0.16);
+        --mono: ui-monospace, "Cascadia Mono", Consolas, "Courier New", monospace;
+        --sans: "Segoe UI", system-ui, sans-serif;
+        --cn-font: "Microsoft YaHei", "Microsoft YaHei UI", sans-serif;
+      }
+      * { margin: 0; padding: 0; box-sizing: border-box; }
+      html, body {
+        width: 1920px; height: 1080px; overflow: hidden;
+        background: var(--bg); color: var(--ink); font-family: var(--cn-font);
+        -webkit-font-smoothing: antialiased;
+      }
+      #root {
+        position: relative; width: 100%; height: 100%; overflow: hidden;
+        background:
+          radial-gradient(1200px 700px at 20% 10%, rgba(103, 212, 255, 0.14), transparent 60%),
+          radial-gradient(1100px 700px at 84% 90%, rgba(242, 186, 255, 0.15), transparent 62%),
+          var(--bg);
+      }
+      .grid { position: absolute; inset: -60px; opacity: 0.32;
+        background-image:
+          linear-gradient(to right, var(--line) 1px, transparent 1px),
+          linear-gradient(to bottom, var(--line) 1px, transparent 1px);
+        background-size: 120px 120px; }
+      .vignette { position: absolute; inset: 0; pointer-events: none;
+        background: radial-gradient(120% 90% at 50% 50%, transparent 55%, rgba(0,0,0,0.55) 100%); }
+
+      .clip { position: absolute; inset: 0; }
+      .stage { position: absolute; inset: 0; padding: 80px 130px 130px;
+        display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
+      .en { font-weight: 800; letter-spacing: 0.01em; line-height: 1.1; }
+      .cn { color: var(--ink); font-size: 46px; font-weight: 600; margin-top: 26px; }
+      .cn.sm { font-size: 38px; color: var(--muted); font-weight: 500; }
+      .kicker { font-size: 26px; letter-spacing: 0.42em; color: var(--cyan); margin-bottom: 30px; }
+      .glow { text-shadow: 0 0 80px rgba(103, 212, 255, 0.45); }
+      .panel { background: rgba(16, 24, 40, 0.72); border: 1px solid var(--line);
+        border-radius: 20px; box-shadow: 0 30px 80px rgba(0,0,0,0.45); }
+      .foot { position: absolute; left: 0; right: 0; bottom: 42px; text-align: center;
+        font-size: 23px; color: #8aa0c4; }
+
+      /* 所有含中文的文本显式使用微软雅黑 */
+      .kicker, .en, .cn, .foot,
+      .tile .tx, .tile .tz, .tile .ck,
+      .chip .t, .chip .d, .chip .z,
+      .byte .tag, .links .tag {
+        font-family: var(--cn-font);
+      }
+
+      .tiles { display: grid; grid-template-columns: repeat(4, 1fr); gap: 28px; margin-top: 54px; width: 1500px; }
+      .tile { padding: 34px 28px; text-align: left; }
+      .tile .ix { font-family: var(--mono); font-size: 22px; color: var(--cyan); }
+      .tile .tx { font-size: 42px; font-weight: 700; margin-top: 16px; }
+      .tile .tz { font-size: 26px; color: var(--muted); margin-top: 10px; }
+      .tile .ck { font-size: 26px; color: var(--cyan); margin-top: 16px; }
+
+      .bytes { width: 900px; margin-top: 14px; display: flex; flex-direction: column; gap: 22px; }
+      .byte { display: flex; align-items: center; gap: 18px; font-size: 27px; }
+      .byte .tag { width: 250px; flex-shrink: 0; white-space: nowrap; text-align: right; color: var(--muted); }
+      .byte .track { flex: 1; height: 26px; border-radius: 999px; background: rgba(120,160,220,0.14); overflow: hidden; }
+      .byte .fill { height: 100%; width: 100%; border-radius: 999px;
+        background: linear-gradient(90deg, var(--cyan), var(--blue)); }
+      .byte.after .fill { width: 94.28%; background: linear-gradient(90deg, var(--violet), var(--cyan)); }
+
+      .chips { display: flex; gap: 22px; margin-top: 48px; }
+      .chip { padding: 26px 36px; min-width: 320px; }
+      .chip .t { font-size: 24px; color: var(--cyan); }
+      .chip .d { font-size: 32px; margin-top: 10px; font-weight: 600; }
+      .chip .z { font-size: 24px; color: var(--muted); margin-top: 6px; }
+
+      .vgrid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 16px; margin-top: 46px; width: 1480px; }
+      .vg { font-family: var(--mono); font-size: 24px; padding: 20px 10px; text-align: center;
+        border-radius: 14px; background: rgba(16,24,40,0.7); border: 1px solid var(--line); }
+
+      .links { margin-top: 44px; display: flex; flex-direction: column; gap: 16px; font-size: 32px; }
+      .links .row { display: flex; gap: 22px; justify-content: center; align-items: baseline; }
+      .links .tag { color: var(--muted); width: 220px; text-align: right; }
+      .links .u { color: var(--ink); font-family: var(--mono); }
+      .links .donate .u { color: var(--blue); }
+    </style>
+  </head>
+  <body>
+    <div
+      id="root"
+      data-composition-id="main"
+      data-start="0"
+      data-duration="60"
+      data-width="1920"
+      data-height="1080"
+    >
+      <div class="grid" id="grid"></div>
+
+      <!-- 1 · 封面 -->
+      <section class="clip" id="s1" data-start="0" data-duration="3.3" data-track-index="0">
+        <div class="stage" id="s1-stage" data-layout-allow-overflow>
+          <div class="en glow" id="s1-en" style="font-size:150px;letter-spacing:-0.02em;font-family:var(--sans);">LUMINA ENGINE</div>
+          <div class="cn" id="s1-cn">它，就是快。</div>
+        </div>
+      </section>
+
+      <!-- 2 · 总览 -->
+      <section class="clip" id="s2" data-start="2.6" data-duration="8.1" data-track-index="1">
+        <div class="stage" id="s2-stage" data-layout-allow-overflow>
+          <div class="kicker" id="s2-k">总览</div>
+          <div class="en" id="s2-en" style="font-size:118px;">四件事，替你做了。</div>
+          <div class="cn sm" id="s2-cn">原版没做的，这台引擎都补上。</div>
+          <div class="tiles">
+            <div class="tile panel"><div class="ix">01</div><div class="tx">加速</div><div class="tz">查表内核</div></div>
+            <div class="tile panel"><div class="ix">02</div><div class="tx">压缩</div><div class="tz">无损容器</div></div>
+            <div class="tile panel"><div class="ix">03</div><div class="tx">训练</div><div class="tz">量化可训</div></div>
+            <div class="tile panel"><div class="ix">04</div><div class="tx">选路</div><div class="tz">自动匹配</div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 3 · 加速 -->
+      <section class="clip" id="s3" data-start="10.0" data-duration="6.3" data-track-index="2">
+        <div class="stage" id="s3-stage" data-layout-allow-overflow>
+          <div class="kicker" id="s3-k">01 · 加速</div>
+          <div class="en" id="s3-en" style="font-size:132px;">别乘。去查。</div>
+          <div class="cn sm" id="s3-cn">同样的权重，更快的推理。</div>
+          <div class="chips">
+            <div class="chip panel"><div class="t">生成</div><div class="d">×1.30</div><div class="z">每秒更多字</div></div>
+            <div class="chip panel"><div class="t">长提示 2048</div><div class="d">×1.57</div><div class="z">越长的提示越快</div></div>
+          </div>
+          <div class="foot" id="s3-foot">测试条件：Bonsai-8B Q1_0 · Intel i5-12500H · 6 线程 · 与原版同机对比</div>
+        </div>
+      </section>
+
+      <!-- 4 · 体积 -->
+      <section class="clip" id="s4" data-start="15.6" data-duration="7.0" data-track-index="3">
+        <div class="stage" id="s4-stage" data-layout-allow-overflow>
+          <div class="kicker" id="s4-k">02 · 体积</div>
+          <div class="en" id="s4-en" style="font-size:116px;">小了一点，一点没少。</div>
+          <div class="cn sm" id="s4-cn">无损容器，字节级别原样还原。</div>
+          <div class="bytes" id="s4-bytes">
+            <div class="byte before"><div class="tag">原文件</div><div class="track"><div class="fill"></div></div></div>
+            <div class="byte after"><div class="tag">.gguf.lumina</div><div class="track"><div class="fill"></div></div></div>
+          </div>
+          <div class="cn sm" id="s4-note" style="margin-top:28px;">加载时透明还原，并缓存复用。</div>
+          <div class="foot" id="s4-foot">测试条件：SmallThinker-4BA0.6B-Instruct Q4_K_M · 还原后与原文件字节完全一致</div>
+        </div>
+      </section>
+
+      <!-- 5 · 训练 -->
+      <section class="clip" id="s5" data-start="21.9" data-duration="4.5" data-track-index="4">
+        <div class="stage" id="s5-stage" data-layout-allow-overflow>
+          <div class="kicker" id="s5-k">03 · 训练</div>
+          <div class="en" id="s5-en" style="font-size:132px;">有什么，训什么。</div>
+          <div class="cn sm" id="s5-cn">量化基座保持冻结。</div>
+          <div class="cn sm" id="s5-sub" style="margin-top:30px;">只训低秩适配器，输出标准 LoRA。</div>
+        </div>
+      </section>
+
+      <!-- 6 · 专家 -->
+      <section class="clip" id="s6" data-start="25.7" data-duration="4.5" data-track-index="5">
+        <div class="stage" id="s6-stage" data-layout-allow-overflow>
+          <div class="kicker" id="s6-k">03 · 训练</div>
+          <div class="en" id="s6-en" style="font-size:132px;">专家，也照训。</div>
+          <div class="cn sm" id="s6-cn">混合专家模型，一样能微调。</div>
+          <div class="cn sm" id="s6-sub" style="margin-top:30px;">路由与三维专家适配器，全部可训。</div>
+        </div>
+      </section>
+
+      <!-- 7 · 选路 -->
+      <section class="clip" id="s7" data-start="29.5" data-duration="5.7" data-track-index="6">
+        <div class="stage" id="s7-stage" data-layout-allow-overflow>
+          <div class="kicker" id="s7-k">04 · 选路</div>
+          <div class="en" id="s7-en" style="font-size:118px;">一份构建，自己认路。</div>
+          <div class="cn sm" id="s7-cn">装在哪台机器，它自己知道。</div>
+          <div class="chips">
+            <div class="chip panel"><div class="t">纯 CPU</div><div class="d">全部变体</div></div>
+            <div class="chip panel"><div class="t">集成显卡</div><div class="d">算子卸载</div></div>
+            <div class="chip panel"><div class="t">独立显卡</div><div class="d">整层上显存</div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 8 · 回顾 -->
+      <section class="clip" id="s8" data-start="34.5" data-duration="6.1" data-track-index="7">
+        <div class="stage" id="s8-stage" data-layout-allow-overflow>
+          <div class="en glow" id="s8-en" style="font-size:132px;">四件事。一台引擎。</div>
+          <div class="cn sm" id="s8-cn">不多不少，刚刚好。</div>
+          <div class="tiles">
+            <div class="tile panel"><div class="tx">加速</div><div class="ck">✓ 查表内核</div></div>
+            <div class="tile panel"><div class="tx">压缩</div><div class="ck">✓ 无损容器</div></div>
+            <div class="tile panel"><div class="tx">训练</div><div class="ck">✓ 量化可训</div></div>
+            <div class="tile panel"><div class="tx">选路</div><div class="ck">✓ 自动匹配</div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 9 · 数据 -->
+      <section class="clip" id="s9" data-start="39.9" data-duration="5.1" data-track-index="8">
+        <div class="stage" id="s9-stage" data-layout-allow-overflow>
+          <div class="en" id="s9-en" style="font-size:126px;">数据，直接喂。</div>
+          <div class="cn sm" id="s9-cn">文本、对话、ShareGPT，三种格式。</div>
+          <div class="cn sm" id="s9-sub" style="margin-top:28px;">训练与验证分离 · 每 500 步存点 · 断点续训。</div>
+        </div>
+      </section>
+
+      <!-- 10 · 适配器 -->
+      <section class="clip" id="s10" data-start="44.3" data-duration="4.5" data-track-index="9">
+        <div class="stage" id="s10-stage" data-layout-allow-overflow>
+          <div class="en" id="s10-en" style="font-size:118px;">训完，谁都能用。</div>
+          <div class="cn sm" id="s10-cn">输出标准 LoRA 适配器。</div>
+          <div class="cn sm" id="s10-sub" style="margin-top:28px;">与上游工具互通 · 可合并回基座。</div>
+        </div>
+      </section>
+
+      <!-- 11 · 变体 -->
+      <section class="clip" id="s11" data-start="48.1" data-duration="7.5" data-track-index="10">
+        <div class="stage" id="s11-stage" data-layout-allow-overflow>
+          <div class="en" id="s11-en" style="font-size:118px;">十四种芯，一份就够。</div>
+          <div class="cn sm" id="s11-cn">一份二进制，自动匹配你的 CPU。</div>
+          <div class="vgrid" id="s11-grid">
+            <div class="vg">x64</div><div class="vg">sse42</div><div class="vg">sandybridge</div><div class="vg">ivybridge</div>
+            <div class="vg">piledriver</div><div class="vg">haswell</div><div class="vg">skylakex</div><div class="vg">cannonlake</div>
+            <div class="vg">cascadelake</div><div class="vg">icelake</div><div class="vg">cooperlake</div><div class="vg">zen4</div>
+            <div class="vg">alderlake</div><div class="vg">sapphirerapids</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 12 · 结尾 -->
+      <section class="clip" id="s12" data-start="54.9" data-duration="5.1" data-track-index="11">
+        <div class="stage" id="s12-stage" data-layout-allow-overflow>
+          <div class="en glow" id="s12-en" style="font-size:110px;letter-spacing:-0.02em;font-family:var(--sans);">LUMINA ENGINE</div>
+          <div class="cn sm" id="s12-cn">一台引擎，四种答案。</div>
+          <div class="links" id="s12-links">
+            <div class="row"><span class="tag">GitHub</span><span class="u">github.com/Happy-380/Lumina-Engine</span></div>
+            <div class="row donate"><span class="tag">爱发电</span><span class="u">afdian.com/a/lumi_380</span></div>
+            <div class="row"><span class="tag">Bilibili</span><span class="u">space.bilibili.com/3546376302496335</span></div>
+          </div>
+        </div>
+      </section>
+
+      <div class="vignette"></div>
+    </div>
+
+    <script>
+      const tl = gsap.timeline({ paused: true });
+
+      // 唯一的动画：换页——整页水平滑动，无缝拼接（页内元素随页面静止）
+      const D = 0.55, SLIDE = 1920;
+      const enter = (sel, t) => tl.fromTo(sel, { x: SLIDE }, { x: 0, duration: D, ease: "expo.inOut" }, t);
+      const leave = (sel, t) => tl.to(sel, { x: -SLIDE, duration: D, ease: "expo.inOut" }, t);
+
+      const T = [0, 2.7, 10.1, 15.7, 22.0, 25.8, 29.6, 34.6, 40.0, 44.4, 48.2, 55.0, 60.0];
+      const stages = ["#s1-stage","#s2-stage","#s3-stage","#s4-stage","#s5-stage","#s6-stage",
+                      "#s7-stage","#s8-stage","#s9-stage","#s10-stage","#s11-stage","#s12-stage"];
+      for (let i = 0; i < stages.length; i++) {
+        enter(stages[i], T[i]);
+        if (i + 1 < stages.length) leave(stages[i], T[i + 1]);
+      }
+
+      window.__timelines["main"] = tl;
+      tl.seek(0);
+    </script>
+  </body>
+</html>

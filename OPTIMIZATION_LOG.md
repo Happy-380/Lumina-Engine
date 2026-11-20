@@ -9,7 +9,32 @@
 
 ---
 
-## Build 32（本次）：训练进度条去掉 `tok/s`（口径不准） —— 并复核 30/31/32 训练等价
+## Build 33（本次）：PrismML `prism.hadamard.*` 权重旋转支持（Ternary Bonsai Q2_0 / mmproj）
+
+**背景**：`Ternary-Bonsai-2-2B-Q2_0.gguf`（`qwen35` 架构，`Q2_0` 三元量化）在 GGUF 里带了一组
+`prism.hadamard.*` 元数据：导出时对每个量化权重沿**输入维**乘了一个正交旋转
+`W' = W · R`（`R` = 分块 512 的归一化 Sylvester–Hadamard ∘ 显式 ±1 符号向量）。
+Build 32 之前引擎不认识这些 key，直接拿 `W'` 当原始权重用：模型能加载、能解码、
+`perplexity` 能跑完，但输出是乱码（`Hello` → `věd三等ieri fitting vastuмот')`）。
+
+**改法**：读元数据，在每个被旋转的 matmul 前把激活转回模型基：`W x = W' · (Rᵀ x)`；
+token embedding 走查表，所以在查表后乘 `Rᵀ`；tied 输出头把同一张量当矩阵用，所以走正向 `Rᵀ`。
+
+| 项 | 内容 |
+| --- | --- |
+| 改动文件 | `src/llama-hparams.h`（新增 `struct llama_prism_hadamard`）、`src/llama-model.h/.cpp`（`llama_model::prism` + `llama_load_prism_hadamard()` 元数据解析）、`src/llama-context.cpp`（传给图参数）、`src/llama-graph.h/.cpp`（`llm_graph_input_prism` + `build_inp_prism` / `build_prism_rotate` / `build_prism_embd` / `build_prism_output` + `build_lora_mm` hook）、`src/models/qwen35.cpp` / `qwen35moe.cpp`（图构造接入）、`CMakeLists.txt` / `tools/rpc/rpc-server.cpp`（32→33） |
+| 性能影响 | 旋转**复用已有的 FWHT 基础设施**（`GGML_HINT_SRC0_IS_HADAMARD` → `ggml_compute_forward_fwht`，CPU/Vulkan/CUDA/Metal/SYCL/BLAS 都是 `O(n log n)`，不是真的 `512×512` matmul）；旋转张量是常量图输入，只拷一次。**其它模型零影响**（全部代码路径 gated by `prism.enabled`） |
+| 已踩的坑 | tied 输出头不能按指针（`model.output == model.tok_embd`）判断：`-ngl -1` offload 时输出张量是另一个实例 → 头前不旋转 → Vulkan PPL 1,236,995（CPU 19.11）。改为按张量名判断后两者一致 |
+| 正确性实测 | `wiki/Background.en.md`，`-c 512 --chunks 2`：本实现 **PPL 19.11**（CPU == `-ngl -1` Vulkan）；逐 token `-b 1 -ub 1` **13.11**；因子顺序换成 `D∘H` → **1,801,563**；embedding/head 换向 → 29,055 ～ 1,236,995。生成侧 `-ub 1/2/4/512` **逐字相同** |
+| 踩到的坑（关键） | ① 图输入张量**必须每个 ubatch 重填**：第一版“常量只拷一次”导致预填充正确、逐 token 生成全错（`perplexity -b 1` = nan），因为调度器会复用输入张量的内存；② tied 输出头要按张量名判定，不能比指针（`-ngl -1` 时是另一个张量实例） |
+| 多模态 | `Ternary-Bonsai-2-2B-mmproj-Q8_0.gguf`（`qwen3vl_merger`）用 `Lumina-Engine-mtmd-cli` 正常加载，768px 图编成 **256** 个视觉 token（12.5 s，纯 CPU `-t 6`）；**原始 embedding 分支不做旋转**（视觉向量已在模型基里） |
+| 调试开关 | `LUMINA_PRISM_ORDER=hd\|dh`、`LUMINA_PRISM_EMBD=inv\|fwd\|none`、`LUMINA_PRISM_OUT=fwd\|inv\|none`、`LUMINA_PRISM_DISABLE=1`（默认即实测最优） |
+| 交付 | 两棵树**从零重编**（原 `build-*` 是 `C:\Lumina-Engine` 时代缓存，路径失效）→ `assemble_bin.bat` → **55 文件**，`--version` = `build 33` |
+| 文档 | `HANDOFF.md` § Build 33、`README(.en).md`、`TRAINING_PIPELINE.md`、`KAGGLE_TEST.md`、`wiki/Changes(.en).md`、`wiki/Compatibility(.en).md` |
+
+---
+
+## Build 32（历史）：训练进度条去掉 `tok/s`（口径不准） —— 并复核 30/31/32 训练等价
 
 **背景**：Build 27 在训练进度条末尾加了 `%5.1f tok/s`。它按 `tokens = ibatch * n_ubatch` 除以
 **整趟累计**耗时算，于是：① 是累计平均而非瞬时速度，开头读盘把均值永久压低；

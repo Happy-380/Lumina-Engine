@@ -1457,6 +1457,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     hparams          (params.hparams),
     cparams          (params.cparams),
     ubatch           (params.ubatch),
+    prism            (params.prism),
     n_embd           (hparams.n_embd),
     n_layer          (hparams.n_layer()),
     n_layer_nextn    (hparams.n_layer_nextn),
@@ -1511,11 +1512,318 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+// --- prism.hadamard.* incoherence rotation --------------------------------
+//
+// The GGUF carries a rotation R that was applied to the input dimension of every
+// quantized weight (W' = W * R). Evaluating the model therefore requires R^-1 = R^T on
+// the activation of every rotated matmul. R is a block-diagonal normalized Sylvester
+// (Walsh) Hadamard transform composed with an element-wise +/-1 sign flip:
+//
+//     R^T = H o D   or   R^T = D o H     (sign_mode = "explicit", block_size = 512)
+//
+// The exact order of the two factors is not encoded in the metadata in a machine
+// readable form; the default below was verified against Ternary-Bonsai-2-2B-Q2_0 (see
+// HANDOFF.md § Build 33). LUMINA_PRISM_ORDER=dh switches to the other factorisation.
+static bool prism_signs_last() {
+    static const bool res = []() {
+        const char * env = getenv("LUMINA_PRISM_ORDER");
+        if (env != nullptr && strcmp(env, "dh") == 0) {
+            return true;  // R^T = D o H  (i.e. Hadamard first, then the signs)
+        }
+        return false;     // R^T = H o D  (i.e. signs first, then the Hadamard)
+    }();
+    return res;
+}
+// LUMINA_PRISM_DEBUG=1 prints the prism rotation bookkeeping (graph builds / input copies)
+static bool prism_debug() {
+    static const bool res = []() {
+        const char * env = getenv("LUMINA_PRISM_DEBUG");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return res;
+}
+// LUMINA_PRISM_NO_FWHT=1 replaces the FWHT fast path with a plain matmul against the
+// materialized normalized Hadamard matrix (slower, but independent of the backend FWHT)
+static bool prism_no_fwht() {
+    static const bool res = []() {
+        const char * env = getenv("LUMINA_PRISM_NO_FWHT");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return res;
+}
+// LUMINA_PRISM_DISABLE=1 reproduces the pre-Build 33 behaviour (no rotation at all)
+static bool prism_disabled() {
+    static const bool res = []() {
+        const char * env = getenv("LUMINA_PRISM_DISABLE");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return res;
+}
+// which transform the token embedding lookup needs: inv (default), fwd or none
+static int prism_embd_mode() {
+    static const int res = []() {
+        const char * env = getenv("LUMINA_PRISM_EMBD");
+        if (env == nullptr)            { return -1; } // inverse
+        if (strcmp(env, "fwd") == 0)  { return  1; }
+        if (strcmp(env, "none") == 0) { return  0; }
+        return -1;
+    }();
+    return res;
+}
+// which transform the tied output head needs: fwd (default), inv or none
+static int prism_out_mode() {
+    static const int res = []() {
+        const char * env = getenv("LUMINA_PRISM_OUT");
+        if (env == nullptr)            { return  1; } // forward
+        if (strcmp(env, "inv") == 0)  { return -1; }
+        if (strcmp(env, "none") == 0) { return  0; }
+        return 1;
+    }();
+    return res;
+}
+
+static inline int prism_popcount(uint64_t v) {
+    int res = 0;
+    while (v != 0) {
+        v &= v - 1;
+        ++res;
+    }
+    return res;
+}
+
+void llm_graph_input_prism::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+
+    if (prism_debug()) {
+        LLAMA_LOG_INFO("%s: rot = %p (buffer %p, host %d), widths = %zu\n", __func__,
+                (void *) rot, rot ? (void *) rot->buffer : nullptr,
+                rot && rot->buffer ? (int) ggml_backend_buffer_is_host(rot->buffer) : -1,
+                signs.size());
+    }
+
+    // note: the tensors must be filled on *every* ubatch, exactly like all other graph
+    // inputs - the scheduler's allocator recycles the memory of an input tensor as soon as
+    // its last consumer has been computed, so "copy once" would be silently corrupted
+    // (symptom: correct prefill, garbage token-by-token decoding)
+
+    // when the rotation is disabled at runtime (LUMINA_PRISM_DISABLE) the tensors are not
+    // referenced by any op and the scheduler leaves them unallocated
+    if (rot == nullptr || rot->buffer == nullptr) {
+        return;
+    }
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(rot->buffer));
+    GGML_ASSERT(rot_data.size() == (size_t) ggml_nelements(rot));
+
+    memcpy(rot->data, rot_data.data(), ggml_nbytes(rot));
+
+    for (auto & [n, t] : signs) {
+        if (t == nullptr || t->buffer == nullptr) {
+            continue;
+        }
+
+        GGML_ASSERT(ggml_backend_buffer_is_host(t->buffer));
+
+        const auto it = prism.signs.find(n);
+        GGML_ASSERT(it != prism.signs.end());
+        GGML_ASSERT(it->second.size() == (size_t) ggml_nelements(t));
+
+        memcpy(t->data, it->second.data(), ggml_nbytes(t));
+    }
+}
+
+void llm_graph_context::build_inp_prism() const {
+    if (prism == nullptr || !prism->enabled || prism_disabled()) {
+        return;
+    }
+
+    if (prism_debug()) {
+        LLAMA_LOG_INFO("%s: building prism inputs for ubatch (n_tokens = %d, n_seqs = %d)\n",
+                __func__, (int) ubatch.n_tokens, (int) ubatch.n_seqs);
+    }
+
+    auto inp = std::make_unique<llm_graph_input_prism>(*prism);
+
+    const int64_t bs = prism->block_size;
+
+    // normalized Sylvester Hadamard matrix: H[k][i] = (-1)^popcount(k & i) / sqrt(bs)
+    // (the data is only used by backends that cannot run the FWHT fast path)
+    inp->rot_data.resize(bs*bs);
+    const float scale = 1.0f/sqrtf((float) bs);
+    for (int64_t i = 0; i < bs; ++i) {
+        for (int64_t k = 0; k < bs; ++k) {
+            inp->rot_data[i*bs + k] = (prism_popcount((uint64_t) (k & i)) & 1) ? -scale : scale;
+        }
+    }
+
+    inp->rot = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, bs, bs);
+    ggml_set_input(inp->rot);
+    ggml_set_name(inp->rot, "inp_prism_rot");
+    cb(inp->rot, "inp_prism_rot", -1);
+
+    for (const auto & [n, s] : prism->signs) {
+        GGML_UNUSED(s);
+
+        ggml_tensor * t = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n);
+        ggml_set_input(t);
+
+        const std::string name = "inp_prism_signs_" + std::to_string(n);
+        ggml_set_name(t, name.c_str());
+        cb(t, name.c_str(), -1);
+
+        inp->signs[n] = t;
+    }
+
+    prism_rot   = inp->rot;
+    prism_signs = inp->signs;
+
+    res->add_input(std::move(inp));
+}
+
+bool llm_graph_context::has_prism_rot(const ggml_tensor * w) const {
+    if (prism == nullptr || !prism->enabled || prism_rot == nullptr || w == nullptr) {
+        return false;
+    }
+
+    if (prism->fwd.count(ggml_get_name(w)) == 0) {
+        return false;
+    }
+
+    if (prism_signs.count(w->ne[0]) == 0) {
+        return false;
+    }
+
+    return true;
+}
+
+ggml_tensor * llm_graph_context::build_prism_rotate(
+          ggml_tensor * cur,
+              int64_t   n,
+                 bool   inverse) const {
+    GGML_ASSERT(prism != nullptr && prism->enabled && prism_rot != nullptr);
+
+    const auto it = prism_signs.find(n);
+    GGML_ASSERT(it != prism_signs.end());
+
+    ggml_tensor * signs = it->second;
+    ggml_tensor * rot   = prism_rot;
+
+    if (cur->type != GGML_TYPE_F32) {
+        cur = ggml_cast(ctx0, cur, GGML_TYPE_F32);
+    }
+
+    if (prism_debug()) {
+        LLAMA_LOG_INFO("%s: n = %d, cur = [%d, %d, %d, %d] contiguous = %d, inverse = %d\n", __func__,
+                (int) n, (int) cur->ne[0], (int) cur->ne[1], (int) cur->ne[2], (int) cur->ne[3],
+                (int) ggml_is_contiguous(cur), (int) inverse);
+    }
+
+    // forward: R^T, inverse: R (both factorisations are applied in the opposite order)
+    const bool signs_first = (prism_signs_last() == inverse);
+
+    const int64_t nb = rot->ne[0]; // Hadamard block size (512)
+
+    auto hadamard = [&](ggml_tensor * x) -> ggml_tensor * {
+        if (prism_no_fwht()) {
+            ggml_tensor * x2 = ggml_is_contiguous(x) ? ggml_reshape_2d(ctx0, x, nb, ggml_nelements(x)/nb)
+                                                     : ggml_cont_2d   (ctx0, x, nb, ggml_nelements(x)/nb);
+            ggml_tensor * r = ggml_mul_mat(ctx0, rot, x2);
+            return ggml_reshape_4d(ctx0, r, x->ne[0], x->ne[1], x->ne[2], x->ne[3]);
+        }
+        return llama_mul_mat_hadamard(ctx0, x, rot);
+    };
+
+    ggml_tensor * res = cur;
+
+    if (signs_first) {
+        res = ggml_mul(ctx0, res, signs);
+        res = hadamard(res);
+    } else {
+        res = hadamard(res);
+        res = ggml_mul(ctx0, res, signs);
+    }
+
+    return res;
+}
+
+ggml_tensor * llm_graph_context::build_prism_embd(
+          ggml_tensor * cur,
+    const ggml_tensor * tok_embd) const {
+    if (prism_disabled() || prism == nullptr || !prism->enabled || tok_embd == nullptr || cur == nullptr) {
+        return cur;
+    }
+
+    if (prism->inv.count(ggml_get_name(tok_embd)) == 0) {
+        return cur;
+    }
+
+    const int64_t n = hparams.n_embd;
+
+    // PLE-style models append extra columns to the embedding output - only rotate the
+    // leading n_embd values, which is exactly what the plain lookup produces
+    if (cur->ne[0] != n || prism_signs.count(n) == 0) {
+        LLAMA_LOG_WARN("%s: unexpected embedding shape - the prism rotation is not applied\n", __func__);
+        return cur;
+    }
+
+    const int mode = prism_embd_mode();
+    if (mode == 0) {
+        return cur;
+    }
+
+    return build_prism_rotate(cur, n, mode < 0);
+}
+
+ggml_tensor * llm_graph_context::build_prism_output(
+          ggml_tensor * cur,
+    const ggml_tensor * head,
+    const ggml_tensor * tok_embd) const {
+    GGML_UNUSED(tok_embd);
+
+    if (prism_disabled() || prism == nullptr || !prism->enabled || head == nullptr || cur == nullptr) {
+        return cur;
+    }
+
+    // The tied head IS the token embedding: the same stored (rotated) tensor is used as a
+    // matrix here, so it needs the forward transform, while the embedding lookup needs the
+    // inverse one. Untied heads are listed in weight_names and handled by build_lora_mm().
+    // note: decide by name - when the tensor is split across devices the duplicated output
+    //       tensor can be a different ggml_tensor instance than tok_embd
+    if (prism->inv.count(ggml_get_name(head)) == 0) {
+        return cur;
+    }
+
+    const int64_t n = hparams.n_embd;
+    if (cur->ne[0] != n || prism_signs.count(n) == 0) {
+        return cur;
+    }
+
+    const int mode = prism_out_mode();
+    if (mode == 0) {
+        return cur;
+    }
+
+    return build_prism_rotate(cur, n, mode < 0);
+}
+
+// --- end prism.hadamard.* -------------------------------------------------
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    // prism.hadamard.*: rotate the activation into the basis of the stored weight
+    ggml_tensor * cur_mm = cur;
+    if (!prism_disabled() && has_prism_rot(w)) {
+        if (prism_debug()) {
+            LLAMA_LOG_INFO("%s: rotate input of %s (w = [%d, %d], cur = [%d, %d, %d, %d])\n", __func__,
+                    ggml_get_name(w), (int) w->ne[0], (int) w->ne[1],
+                    (int) cur->ne[0], (int) cur->ne[1], (int) cur->ne[2], (int) cur->ne[3]);
+        }
+        cur_mm = build_prism_rotate(cur, w->ne[0], false);
+    }
+
+    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur_mm);
 
     if (w_s) {
         res = ggml_mul(ctx0, res, w_s);
@@ -2399,6 +2707,10 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
 
             cur = ggml_add(ctx0, cur, inpL_delta);
         }
+
+        // prism.hadamard.*: the token embeddings are stored rotated - undo the rotation here.
+        // note: raw (multimodal) embeddings are NOT rotated, they are already in the model basis
+        cur = build_prism_embd(cur, tok_embd);
 
         if (n_embd_inp != n_embd) {
             cur = ggml_pad(ctx0, cur, hparams.n_embd_inp() - n_embd, 0, 0, 0);

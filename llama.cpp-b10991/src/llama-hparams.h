@@ -6,6 +6,10 @@
 #include <bitset>
 #include <cassert>
 #include <cmath>
+#include <map>
+#include <set>
+#include <string>
+#include <vector>
 
 // bump if necessary
 #define LLAMA_MAX_LAYERS  512
@@ -48,6 +52,40 @@ struct llama_hparams_convnext {
     uint32_t n_embd;
     uint32_t n_layer;
 };
+
+// PrismML incoherence rotation (the "prism.hadamard.*" GGUF metadata block).
+//
+// Ternary Bonsai and similar quantized models are produced with a rotation applied
+// along the *input* dimension of every quantized weight: W' = W * R. The rotation is a
+// block-diagonal normalized Sylvester (Walsh) Hadamard transform, optionally followed by
+// an element-wise +/-1 sign flip (sign_mode = "explicit"). Because the rotation is
+// orthogonal, the model can only be evaluated if the runtime applies R^-1 (== R^T) to
+// every activation that feeds a rotated weight.
+//
+// Notes:
+//  - the sign vectors are stored per transform *width* (== ne[0] of the rotated weight),
+//    i.e. all weights with the same input width share the same signs;
+//  - token embeddings are not fed through a matmul, so for them the transform has to be
+//    applied to the looked-up rows instead (hence the separate "inverse" list);
+//  - unquantized (F32) weights of the same model are *not* rotated, which is why the
+//    rotation has to be applied per matmul instead of keeping the residual stream in the
+//    rotated basis.
+struct llama_prism_hadamard {
+    bool    enabled     = false;
+    bool    tied_output = false;
+    int64_t block_size  = 0;
+
+    // sign vector per transform width (ne[0] of the rotated weight)
+    std::map<int64_t, std::vector<float>> signs;
+
+    // weights whose input activation must be rotated with the forward transform
+    std::set<std::string> fwd;
+
+    // weights that produce rotated outputs (token embedding lookup) and therefore need
+    // the inverse transform applied to their output
+    std::set<std::string> inv;
+};
+
 
 struct llama_hparams {
     // note: use the `_impl` suffix to avoid name conflict between members and getters

@@ -162,7 +162,7 @@ D:\Lumina-Engine\
 3. `build-release` / `build-clang` 是**构建中间产物**，供 `assemble_bin.bat` 取件；不是交付物。
 4. 旧的单变体 `build\` 目录已清理，仅保留 `configure.bat` + `build.bat` 供本机快速开发重建，
    **不参与交付**。
-5. 交付目录由脚本整体重建（先删后建），因此不要在 `Lumina-Engine-Bin` 内放置需要保留的手工文件。
+5. 交付目录由 `assemble_bin.bat` **增量覆盖**（Build 31 起不再删建），因此不要在 `Lumina-Engine-Bin` 内放置与产物同名的手工文件（会被覆盖）。
 
 ---
 
@@ -171,7 +171,7 @@ D:\Lumina-Engine\
 ```bat
 cd D:\Lumina-Engine\Lumina-Engine-Bin
 
-REM 1) 版本横幅：应显示 Build 31 (Based on llama.cpp b-10991)
+REM 1) 版本横幅：应显示 Build 33 (Based on llama.cpp b-10991)
 Lumina-Engine-cli.exe --version
 Lumina-Engine-server.exe --help
 Lumina-Engine-train.exe --version
@@ -189,7 +189,7 @@ set GGML_Q1_LUT_DEBUG=
 
 预期：
 
-- 横幅显示 `Build 31 (Based on llama.cpp b-10991)`；`cli` / `server` / `train` 等所有控制台
+- 横幅显示 `Build 33 (Based on llama.cpp b-10991)`；`cli` / `server` / `train` 等所有控制台
   启动时均打印同一套 ASCII logo + Build 号 + 项目链接；
 - `-p "The capital of France is"` 输出 `Paris.`；
 - 交付目录 55 个文件（14 个 CPU 变体 + `ggml-vulkan.dll` + 工具 + 运行库）；

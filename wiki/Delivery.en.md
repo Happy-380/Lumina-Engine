@@ -164,8 +164,8 @@ D:\Lumina-Engine\
 3. `build-release` / `build-clang` are **build intermediates** consumed by `assemble_bin.bat`; they are not deliverables.
 4. The legacy single-variant `build\` tree was cleaned up. `configure.bat` + `build.bat` remain for quick
    local development only and **do not participate in delivery**.
-5. The delivery directory is rebuilt wholesale (delete-then-create), so do not keep hand-made files inside
-   `Lumina-Engine-Bin`.
+5. `assemble_bin.bat` **overlays into** the delivery directory (it no longer deletes it, since Build 31), so
+   do not keep hand-made files inside `Lumina-Engine-Bin` that share a name with a build product.
 
 ---
 
@@ -174,7 +174,7 @@ D:\Lumina-Engine\
 ```bat
 cd D:\Lumina-Engine\Lumina-Engine-Bin
 
-REM 1) Banner: should show Build 31 (Based on llama.cpp b-10991)
+REM 1) Banner: should show Build 33 (Based on llama.cpp b-10991)
 Lumina-Engine-cli.exe --version
 Lumina-Engine-server.exe --help
 Lumina-Engine-train.exe --version
@@ -192,7 +192,7 @@ set GGML_Q1_LUT_DEBUG=
 
 Expected:
 
-- Banner shows `Build 31 (Based on llama.cpp b-10991)`; every console (`cli` / `server` / `train`
+- Banner shows `Build 33 (Based on llama.cpp b-10991)`; every console (`cli` / `server` / `train`
   / ...) prints the same ASCII logo + build number + project links at startup;
 - `-p "The capital of France is"` prints `Paris.`;
 - 55 files in the delivery directory (14 CPU variants + `ggml-vulkan.dll` + tools + runtime DLLs);

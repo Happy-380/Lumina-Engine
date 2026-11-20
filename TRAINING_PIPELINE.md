@@ -1,7 +1,14 @@
 # Lumina-Engine 三段式训练流程（Stage1 → Stage2 → Stage3）
 
 > 适用：`SmallThinker-4BA0.6B-Instruct`（MoE）QLoRA 三阶段微调
-> 工具：`Lumina-Engine-Bin\Lumina-Engine-train.exe`（Build 32）
+> 工具：`Lumina-Engine-Bin\Lumina-Engine-train.exe`（Build 33）
+>
+> **Build 33：训练代码与数值未变**（只新增 `prism.hadamard.*` 旋转推理支持 + 版本号）。
+> 顺带确认一个**既有**限制（与 Build 33 无关）：Qwen3.5 系列（`qwen35`）在 `-b/-ub ≥ 96` 时会触发
+> `ggml-cpu/binary-ops.cpp: GGML_ASSERT(nb00 == sizeof(src0_t))`（backward 里有非连续 `src0`），
+> 未加旋转的 `Qwen3.5-0.8B-Q4_K_M` 同样复现；`-b/-ub ≤ 64` 正常，本文的配置（`-ub 32` 一类）不受影响。
+> 是否用 prism 模型训练都遵循同一套流程：`prism.hadamard.*` 只影响基座的 `mul_mat` 输入旋转，
+> LoRA 适配器仍作用在「未旋转」的原始激活基上（即与原模型数学等价），适配器格式不变。
 >
 > **Build 30 起：本文所有示例命令已显式加 `--no-mask-history`。** 另外两点来自 Build 30 的命令复核：
 > ① 8 GB 机器上默认 LoRA targets 会被**静默缩减**（MoE 专家 FFN `ffn_up/ffn_down` 被丢掉，只留

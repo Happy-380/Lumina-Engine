@@ -1,4 +1,58 @@
-## 0. 训练进度条去掉 `tok/s`（Build 32）
+## 0. PrismML `prism.hadamard.*` 权重旋转支持（Build 33）
+
+PrismML 的三元模型（如 `Ternary-Bonsai-2-2B-Q2_0.gguf`，`qwen35` 架构 + `Q2_0` 三元量化）在 GGUF 里
+带了一组 `prism.hadamard.*` 元数据：**每个量化权重都是“旋转后”存的**，
+
+```text
+W' = W · R,    R = 分块(512) 归一化 Sylvester–Hadamard  ∘  diag(±1 符号向量)
+```
+
+所以推理时必须把激活转回同一个基：`y = W x = W' · (Rᵀ x)`。Build 32 之前引擎不认识这些 key，
+直接拿 `W'` 当原始权重用 —— 模型能加载、能解码、`perplexity` 也能跑完，但输出是乱码
+（`Hello` → `věd三等ieri fitting vastuмот')`）。
+
+Build 33 读取元数据并在正确的位置插入旋转：
+
+| 位置 | 变换 |
+|---|---|
+| 每个被旋转的量化权重（`weight_names`，本模型 150 个）的 `mul_mat` 输入 | 正向 `H(diag(s)·x)`（分块 512） |
+| `token_embd.weight` 查表输出（`inverse_weight_names`） | 逆向 `diag(s)·H(x)`；**原始 embedding（视觉）分支不动** |
+| tied 输出头（`tied_output = true`） | 正向 `H(diag(s)·x)` |
+
+| 文件 | 类型 | 说明 |
+|------|------|------|
+| `src/llama-hparams.h` | 修改 | 新增 `struct llama_prism_hadamard`（`enabled` / `tied_output` / `block_size` / `signs[width]` / `fwd` / `inv`）；**不放进 `llama_hparams`**（它必须保持 trivially copyable） |
+| `src/llama-model.h` / `.cpp` | 修改 | `llama_model::prism` + `llama_load_prism_hadamard()`：用原始 gguf API 解析并校验元数据，不符只告警并禁用 |
+| `src/llama-context.cpp` | 修改 | `graph_params()` 传入 `&model.prism` |
+| `src/llama-graph.h` / `.cpp` | 修改 | `llm_graph_input_prism`（常量旋转矩阵 + 符号向量）、`build_inp_prism()` / `build_prism_rotate()` / `build_prism_embd()` / `build_prism_output()` / `has_prism_rot()`；`build_lora_mm()` 与 `build_inp_embd()` 的 token 分支接入 |
+| `src/models/qwen35.cpp` / `qwen35moe.cpp` | 修改 | 图构造开头 `build_inp_prism()`；tied 头（含 MTP draft 头）前 `build_prism_output()` |
+| `CMakeLists.txt` / `tools/rpc/rpc-server.cpp` | 修改 | Build 32 → 33 |
+
+实现复用引擎已有的 FWHT 快速路径（`GGML_HINT_SRC0_IS_HADAMARD` → `ggml_compute_forward_fwht`），
+CPU / Vulkan / CUDA / Metal / SYCL 都是 `O(n log n)`；不支持该 hint 的后端退化为真实矩阵乘（结果相同）。
+旋转张量是常量图输入，只在第一次 `set_input` 拷贝。**没有该元数据的模型行为完全不变。**
+
+⚠️ 实现细节（两个坑，都踩过）：
+
+1. **图输入张量必须每个 ubatch 重填**。第一版把旋转矩阵/符号当常量、只在一个图对象第一次
+   `set_input` 时拷一次 —— 结果**预填充正确、逐 token 生成从第一步就错**（`ggml_backend_sched`
+   的分配器会在输入张量的最后一个消费者算完后复用它的内存）。症状：`-ub 512` 首个 token 对、
+   第 2 个起乱码；`perplexity -b 1` 直接 `nan`；批处理困惑度却完全正常（19.11 vs 错误配置的 1.8e6）。
+   修法：`set_input()` 无条件 memcpy（1 MB/步，可忽略）。
+2. **tied 输出头要按张量名判定**（`name ∈ inverse_weight_names`），不能比较
+   `model.output == model.tok_embd` —— `-ngl -1` offload 时 `TENSOR_DUPLICATED` 的输出张量是另一个
+   `ggml_tensor` 实例（症状：CPU PPL 19.11，Vulkan 1,236,995）。
+
+实测（`wiki/Background.en.md`，`-c 512 --chunks 2`）：本实现 **PPL 19.11**（CPU 与 `-ngl -1` Vulkan 相同）；
+逐 token（`-b 1 -ub 1`）**13.11**；符号与 Hadamard 顺序对调 → **1,801,563**；embedding / 输出头方向错误
+→ 29,055 ～ 1,236,995。生成侧 `-ub 1 / 2 / 4 / 512` 结果**逐字相同**（`…France is` → ` Paris.`；
+CLI `Hello` → 连贯的思考段落）；mmproj 把 768px 图编成 256 个视觉 token 并能正确描述图像内容。
+调试开关：`LUMINA_PRISM_DISABLE` / `LUMINA_PRISM_ORDER` / `LUMINA_PRISM_EMBD` / `LUMINA_PRISM_OUT` /
+`LUMINA_PRISM_NO_FWHT` / `LUMINA_PRISM_DEBUG` / `LUMINA_NO_FUSED_GDN`。详见 `HANDOFF.md` § Build 33。
+
+---
+
+## 0.1 训练进度条去掉 `tok/s`（Build 32）
 
 Build 27 在训练进度条末尾加了实时吞吐 `%5.1f tok/s`，但它是**整趟累计平均值**：开头读盘 / 建缓存会把均值
 永久压低；分子还把**全掩码 prompt 微批**（`loss=0`，一次 ubatch 只出 1 行 loss）的 token 算进去；
@@ -26,7 +80,7 @@ train: [███████▉] data=0000008/0000008 loss=1.94035±0.22760 acc
 
 ---
 
-## 0.1 CPU Q4_K GEMV 软件预取（Build 31）
+## 0.2 CPU Q4_K GEMV 软件预取（Build 31）
 
 纯 CPU 单 token 生成的时间几乎全在 `ggml_gemv_q4_K_8x8_q8_K`（repack 后的 Q4_K 解码内核）上。
 本机实测该内核单线程只有 6.0–7.5 GB/s，而同一线程纯流式读上限是 11.6–13.1 GB/s —— 说明瓶颈是
@@ -55,7 +109,7 @@ cache line）整块 `_mm_prefetch` 进 L1。**不要加 `if (b + 2 < nb)` 边界
 正确性：改后内核输出与改前 **逐位相同**（`memcmp`）；真实引擎贪心解码（`--temp 0`）生成文本与
 Build 30 完全一致；7 个实验变体对独立标量参考 `max_abs_err = 4.8e-07`（容差 2.9e-06）。
 
-## 0.2 CLI 多轮对话修复（Build 30）
+## 0.3 CLI 多轮对话修复（Build 30）
 
 MoE 模型对话时第二轮及之后只回 `None`：CLI 每轮无条件把 assistant 消息（content 可能为空串）追加进
 历史，一旦某轮没有可见输出，这条空 assistant 轮就永久留在历史里，后续请求变成
@@ -71,7 +125,7 @@ MoE 模型对话时第二轮及之后只回 `None`：CLI 每轮无条件把 assi
 实测：`printf '你好\n1+1=?\n' | cli` 在 Build 29 下会持续输出 `> `（300 s / 1,483,183 行），
 Build 30 正常两轮后 `Exiting...`（37 行，exit 0）。
 
-## 0.3 `--mask-history` 训练路径问题 + 归一化口径（Build 29）
+## 0.4 `--mask-history` 训练路径问题 + 归一化口径（Build 29）
 
 实测：同一 token 流、`-c 4096`，`--mask-history` 的每批 loss ≈ 11.9，`--no-mask-history` ≈ 1.47
 （各跑两次逐位一致；标签核对无误；推理侧同文本 PPL 2.03）。**训练请改用 `--no-mask-history`。**
@@ -83,7 +137,7 @@ Build 30 正常两轮后 `Exiting...`（37 行，exit 0）。
 | `tools/lumina-train/lumina-train.cpp` | 修改 | 提示 `--mask-history` 的路径问题与推荐配置 |
 | `CMakeLists.txt` / `tools/rpc/rpc-server.cpp` | 修改 | Build 28 → 29 |
 
-## 0.4 训练 loss 显示口径说明（Build 28）
+## 0.5 训练 loss 显示口径说明（Build 28）
 
 进度条 loss 是累计均值；CE 核按全部行求均值，而 `ggml_opt_result_loss()` 的补偿项
 `ndata/nlabeled` 用「数据集点数 / 已标注行数」（单位不一致）→ 已标注行很少时读数被放大约 8 倍
@@ -95,7 +149,7 @@ Build 30 正常两轮后 `Exiting...`（37 行，exit 0）。
 | `tools/lumina-train/lumina-train.cpp` | 修改 | 删除 `-c > 2048` 告警（结论有误）；新增 `--mask-history` 口径说明 |
 | `CMakeLists.txt` / `tools/rpc/rpc-server.cpp` | 修改 | Build 27 → 28 |
 
-## 0.5 训练数据集磁盘流式落盘（Build 27）
+## 0.6 训练数据集磁盘流式落盘（Build 27）
 
 `Lumina-Engine-train` 加载 `--dataset` 时，旧实现把整份语料追加进两个 `std::vector`
 （`int32` token ids + `uint8` 可训练掩码 = **5 B/token**），加载完成后才序列化成临时文件再 mmap。
@@ -116,7 +170,7 @@ Build 30 正常两轮后 `Exiting...`（37 行，exit 0）。
 | Build 26 | 2074 MB | 29282 rec / 300,021,789 tok / 278,340 datapoints |
 | Build 27 | **645 MB** | 完全相同 |
 
-## 0.6 训练梯度累加器修复（Build 26）
+## 0.7 训练梯度累加器修复（Build 26）
 
 `llama-finetune` / `llama_opt_epoch()` 路径（`Lumina-Engine-train`）在
 `n_batch / n_ubatch > 1` 时，旧代码的梯度累加器从未清零：每个优化器步实际应用的是
@@ -134,7 +188,7 @@ Build 30 正常两轮后 `Exiting...`（37 行，exit 0）。
 
 ---
 
-## 0.7 控制台统一启动画面（Build 24）
+## 0.8 控制台统一启动画面（Build 24）
 
 所有控制台工具启动时打印同一套 Lumina-Engine 启动画面（ASCII logo + Build 号 + 项目链接）：
 

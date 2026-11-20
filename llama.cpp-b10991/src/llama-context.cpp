@@ -233,6 +233,16 @@ llama_context::llama_context(
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = false;
 
+    // debug: LUMINA_NO_FUSED_GDN=1 falls back to the plain graph formulation of the
+    // gated delta net (chunked / autoregressive), e.g. to compare numerics
+    {
+        const char * env = getenv("LUMINA_NO_FUSED_GDN");
+        if (env != nullptr && atoi(env) != 0) {
+            cparams.fused_gdn_ar = false;
+            cparams.fused_gdn_ch = false;
+        }
+    }
+
     cparams.fused_lid = true;
     cparams.auto_flid = false;
 
@@ -2483,6 +2493,7 @@ llm_graph_params llama_context::graph_params(
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
+        /*.prism       =*/ &model.prism,
         /*.ubatch      =*/ ubatch,
         /*.gtype       =*/ gtype,
         /*.sched       =*/ sched.get(),

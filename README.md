@@ -2,9 +2,9 @@
 
 > 🌐 **中文** | [English](README.en.md)
 
-> 基于 llama.cpp b-10991 的 Windows x86-64 推理 / 压缩 / 训练引擎：为 **Bonsai Q1_0** 提供专用 CPU 内核，同时提供面向更多模型的 **Vulkan 加速、自动设备策略、无损压缩与 QLoRA 训练**。
+> 基于 llama.cpp b-10991 的 Windows x86-64 推理 / 压缩 / 训练引擎：为 **Bonsai Q1_0** 提供专用 CPU 内核，支持 **PrismML 三元（Q2_0）Bonsai 的 `prism.hadamard.*` 权重旋转**，同时提供面向更多模型的 **Vulkan 加速、自动设备策略、无损压缩与 QLoRA 训练**。
 
-![Build](https://img.shields.io/badge/build-32-blue)
+![Build](https://img.shields.io/badge/build-33-blue)
 ![llama.cpp](https://img.shields.io/badge/llama.cpp-b10991-green)
 ![Platform](https://img.shields.io/badge/platform-Windows%20x86--64-lightgrey)
 ![License](https://img.shields.io/badge/license-AGPL--3.0-orange)
@@ -16,7 +16,7 @@
 
 - **这是什么**：llama.cpp b-10991 的增强分支。最核心的是针对 `GGML_TYPE_Q1_0`（1.125 bit/权重）的纯 CPU 快速路径；同时也把通用推理加速、GGUF 无损压缩和量化模型 QLoRA 训练整合进同一套交付。
 - **给谁用**：想在普通 Windows 机器上低成本跑 1-bit 模型的人；用 Q4_K / Q8_0 模型做推理、压缩或微调的人；以及需要在 8 GB 内存上做长上下文训练的人。
-- **核心差异**：不止"能跑"——Q1_0 预填充最高 **+43%**、token 生成 **+30%**；Q4_K 模型无损压到 **94.28%**；量化模型可在纯 CPU 上 QLoRA，8 GB 内存可跑 32K 上下文。
+- **核心差异**：不止"能跑"——Q1_0 预填充最高 **+43%**、token 生成 **+30%**；Q4_K 模型无损压到 **94.28%**；量化模型（含 PrismML 三元 Q2_0）可在纯 CPU 上 QLoRA，8 GB 内存可跑 32K 上下文。
 
 **最快跑起来（模型已就位）：**
 
@@ -123,7 +123,7 @@ Bonsai-8B 的全部权重都是 1-bit（`Q1_0`，128 个权重共享一个 fp16 
 | 系统 | Windows 10 / 11 x86-64 |
 | CPU | 支持 SSE4.2；**推荐 AVX2**（Haswell 2013+ / Zen+）。支持 VNNI / AVX-512 更快 |
 | 内存 | 8B 模型建议 ≥ 8 GB；4 GB 可跑 1.7B |
-| 模型 | **Bonsai-8B GGUF（Q1_0）**，约 1.07 GiB，需自行从 [PrismML](https://prismml.com) 获取，仓库不附带；其他 Q4_K / Q8_0 GGUF 也可直接加载 |
+| 模型 | **Bonsai-8B GGUF（Q1_0）**，约 1.07 GiB，需自行从 [PrismML](https://prismml.com) 获取，仓库不附带；**Ternary-Bonsai-2-2B（`qwen35` + `Q2_0` + `prism.hadamard.*`）及其 mmproj 可直接加载**（见 [PrismML 三元模型](#prismml-三元模型)）；其他 Q4_K / Q8_0 GGUF 也可直接加载 |
 | 运行时 | 推理**无需 Python / Node / CUDA**，预编译包已带全部 DLL；压缩脚本需要 Python 3 |
 
 ### 方式一：直接使用预编译产物（推荐）
@@ -280,6 +280,67 @@ Lumina-Engine-cli.exe -m ..\Bonsai-8B.gguf --lora out\stage2.lora.gguf -p "你�
 
 ---
 
+## PrismML 三元模型
+
+Build 33 起，引擎能直接加载带 `prism.hadamard.*` 元数据的 **PrismML Bonsai 三元模型**，例如
+`Ternary-Bonsai-2-2B-Q2_0.gguf`（`qwen35` 架构，`Q2_0` 三元量化，约 2.1 bit/权重）及其多模态投影
+`Ternary-Bonsai-2-2B-mmproj-Q8_0.gguf`。
+
+```bat
+cd /d C:\Lumina-Engine\Lumina-Engine-Bin
+
+REM 文本
+Lumina-Engine-cli.exe -m ..\Ternary-Bonsai-2-2B-Q2_0.gguf -p "The capital of France is" -n 32 -t 6
+
+REM 多模态（mmproj）
+Lumina-Engine-mtmd-cli.exe -m ..\Ternary-Bonsai-2-2B-Q2_0.gguf ^
+    --mmproj ..\Ternary-Bonsai-2-2B-mmproj-Q8_0.gguf ^
+    --image ..\test.png -p "Describe this image." -n 64 -t 6
+```
+
+这些模型的量化权重是“旋转后”存的（`W' = W · R`，`R` = 分块 512 归一化 Sylvester–Hadamard ∘ 显式 ±1
+符号），因此推理时必须在每个被旋转的 matmul 前把激活转进同一个基。引擎从 GGUF 元数据自动读取：
+
+| 元数据 | 作用 |
+|---|---|
+| `prism.hadamard.block_size` | 分块大小（当前模型 512） |
+| `prism.hadamard.sign_widths` / `sign_values` | 每个输入宽度一组 ±1 符号（`2048` / `6144`，共 8192 个） |
+| `prism.hadamard.weight_names` | 需要**正向**旋转其输入的量化权重（150 个） |
+| `prism.hadamard.inverse_weight_names` | 走查表的权重（`token_embd.weight`），查表后做**逆**变换 |
+| `prism.hadamard.tied_output` | 输出头与 embedding 共用张量，头前做**正**变换 |
+
+实现上复用引擎已有的 FWHT 快速路径（`GGML_HINT_SRC0_IS_HADAMARD`）：旋转是 `O(n log n)`，
+CPU / Vulkan / CUDA / Metal / SYCL 都走快路径，不支持的后端退化为真实矩阵乘（结果相同、仅更慢）。
+**没有该元数据的模型行为完全不变**（所有代码路径都按 `prism.enabled` 关闭）。
+
+实测（本机 i5-10400 / 8 GB，纯 CPU `-t 6`，`wiki/Background.en.md`、`-c 512 --chunks 2`）：
+
+| 配置 | PPL |
+|---|---|
+| 本实现（`hd` + `embd=inv` + `out=fwd`，CPU 与 `-ngl -1` Vulkan 相同） | **19.11** |
+| 逐 token（`-b 1 -ub 1`，`-c 256`） | **13.11** |
+| 符号与 Hadamard 顺序对调（`LUMINA_PRISM_ORDER=dh`） | 1,801,563 |
+| embedding / 输出头方向错误 | 29,055 ～ 1,236,995 |
+
+生成侧（`-ub 1 / 2 / 4 / 512` 结果逐字相同）：
+
+```text
+The capital of France is          →  Paris.
+… The capital of Italy is         →  Rome. The capital of Spain …
+Hello（CLI 聊天）                 →  Okay, the user just said "Hello". That's a straightforward
+                                     greeting. I should respond warmly and invite them to ask …
+多模态（mmproj + 768px 图）        →  I see two primary shapes. A large red circle in the upper …
+```
+
+`Ternary-Bonsai-2-2B-mmproj-Q8_0.gguf`（`qwen3vl_merger`）把 768px 图编成 256 个视觉 token（约 10–12 s）。
+细节、A/B 全表与两个踩到的坑见 [HANDOFF.md](HANDOFF.md) § Build 33。
+
+> `Q2_0` 是三元量化（每 64 个权重一个 fp16 尺度），这个 2B 模型的困惑度就在 ~19 这个量级。
+> 排障时可用 `LUMINA_PRISM_DISABLE=1`（关闭旋转，复现旧版乱码）、`LUMINA_PRISM_DEBUG=1`（打印旋转书签）、
+> `LUMINA_PRISM_NO_FWHT=1`（改用真实矩阵乘）；`LUMINA_NO_FUSED_GDN=1` 可关闭 fused gated delta net。
+
+---
+
 ## 性能实测
 
 > 以下为 **Q1_0 专用路径**的数据；Vulkan、多 CPU 变体、训练与压缩等通用优化的收益见[优化范围](#优化范围)。
@@ -407,6 +468,13 @@ Build 31 起 Clang 构建直接把二进制写进 `Lumina-Engine-Bin\`（`config
 | `LUMINA_Q1_VK_INT8=1` | 关 | 实验性 int8 prefill 路径 |
 | `LUMINA_TRAIN_ALLOW_GPU=1` | 关 | 允许训练使用 GPU（实验性，不推荐） |
 | `LUMINA_OP_PROF=1` | 关 | 打印训练算子耗时剖析 |
+| `LUMINA_PRISM_DISABLE=1` | 关 | 关闭 `prism.hadamard.*` 权重旋转（复现 Build 32 的乱码输出，排障用） |
+| `LUMINA_PRISM_ORDER=hd\|dh` | `hd` | 旋转因子顺序：`H(diag(s)·x)`（默认，实测正确）/ `diag(s)·H(x)` |
+| `LUMINA_PRISM_EMBD=inv\|fwd\|none` | `inv` | token embedding 查表后的变换方向 |
+| `LUMINA_PRISM_OUT=fwd\|inv\|none` | `fwd` | tied 输出头前的变换方向 |
+| `LUMINA_PRISM_NO_FWHT=1` | 关 | 不用 FWHT 快速路径，改用真实 `512×512` 矩阵乘（排障 / 对照） |
+| `LUMINA_PRISM_DEBUG=1` | 关 | 打印旋转书签（被旋转的权重与形状、常量重填），需配合 `-v` |
+| `LUMINA_NO_FUSED_GDN=1` | 关 | 关闭 fused gated delta net（回退 chunked / autoregressive 图写法） |
 
 ---
 
@@ -477,7 +545,7 @@ Lumina-Engine/
 源码本身跨平台，但本仓库的预编译交付与性能测试集中在 Windows x86-64；Linux 需自行用 CMake 构建。
 
 **Q：能微调 1-bit 模型吗？**
-可以。基座权重保持量化并冻结，只训练 LoRA 适配器（QLoRA），支持 Q1_0 / Q4_K / Q8_0 和 MoE。
+可以。基座权重保持量化并冻结，只训练 LoRA 适配器（QLoRA），支持 Q1_0 / Q2_0（三元）/ Q4_K / Q8_0 和 MoE（含 PrismML `prism.hadamard.*` 旋转模型，Build 33 实测）。
 
 **Q：这些优化只对 1-bit 模型有效吗？**
 不是。Q1_0 专用内核只影响 1-bit 模型；14 个 CPU 变体、Vulkan、自动设备策略、无损压缩和 QLoRA 训练都适用于其他模型 / 量化类型。详见[优化范围](#优化范围)。
@@ -488,7 +556,8 @@ Lumina-Engine/
 
 | Build | 主要内容 |
 |------:|----------|
-| **32** | 训练进度条去掉不准的 `tok/s`（它是整趟累计平均，掺了全掩码 prompt 微批与开头读盘，同一次训练内能从 14 漂到 26）；顺带复核 Build 30/31/32 训练结果**逐位一致**（同一命令适配器 SHA-256 相同） |
+| **33** | 支持 **PrismML `prism.hadamard.*` 权重旋转**（Ternary-Bonsai-2-2B-Q2_0 / `qwen35`）：按元数据在每个被旋转的量化权重前对激活做分块 512 归一化 Sylvester–Hadamard + ±1 符号翻转，token embedding 查表做逆变换，tied 输出头做正变换；复用已有 FWHT 快速路径，其它模型零影响；mmproj（`qwen3vl_merger`）多模态跑通 |
+| 32 | 训练进度条去掉不准的 `tok/s`（它是整趟累计平均，掺了全掩码 prompt 微批与开头读盘，同一次训练内能从 14 漂到 26）；顺带复核 Build 30/31/32 训练结果**逐位一致**（同一命令适配器 SHA-256 相同） |
 | 31 | CPU 解码提速：repack 后的 Q4_K GEMV 内核加软件预取，纯 CPU 单 token 生成 **+13%**（输出逐位不变）；新增可复现的内核级 A/B 基准 `tests/bench-cpu-kern.cpp` |
 | 30 | CLI 多轮对话修复：空回复不再写入历史（MoE 从第二轮起只回 `None` 的根因）；stdin 关闭 / EOF 时退出而不是死循环；每轮闭合 `[End thinking]` |
 | 29 | `--mask-history` 训练路径损坏定位（训练改用 `--no-mask-history`）+ loss/accuracy 归一化口径显式化 |

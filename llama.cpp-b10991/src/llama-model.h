@@ -700,6 +700,10 @@ struct llama_model {
     // gguf metadata
     std::unordered_map<std::string, std::string> gguf_kv;
 
+    // prism.hadamard.* incoherence rotation (Ternary Bonsai and similar models);
+    // disabled for every model that does not carry this metadata
+    llama_prism_hadamard prism;
+
     // list of devices used in this model
     std::vector<llama_device> devices;
 

@@ -1,4 +1,63 @@
-## 0. Training progress bar loses `tok/s` (Build 32)
+## 0. PrismML `prism.hadamard.*` weight rotation (Build 33)
+
+PrismML's ternary models (e.g. `Ternary-Bonsai-2-2B-Q2_0.gguf`, `qwen35` architecture + `Q2_0` ternary
+quantization) ship a `prism.hadamard.*` metadata block: **every quantized weight is stored rotated**,
+
+```text
+W' = W * R,    R = block(512) normalized Sylvester-Walsh-Hadamard  o  diag(explicit +/-1 signs)
+```
+
+so inference must rotate the activation back into the same basis: `y = W x = W' * (R^T x)`. Before Build 33
+the engine ignored those keys and used `W'` as if it were `W` -- the model loaded, decoded and even ran
+`perplexity` to completion, but the output was gibberish (`Hello` -> `věd三等ieri fitting vastuмот')`).
+
+Build 33 reads the metadata and inserts the rotation exactly where it belongs:
+
+| Position | Transform |
+|---|---|
+| input of every rotated quantized weight (`weight_names`, 150 here) | forward `H(diag(s) x)`, block 512 |
+| `token_embd.weight` lookup output (`inverse_weight_names`) | inverse `diag(s) H(x)`; the **raw (vision) embedding branch is left untouched** |
+| tied output head (`tied_output = true`) | forward `H(diag(s) x)` |
+
+| File | Type | Change |
+|------|------|--------|
+| `src/llama-hparams.h` | modified | new `struct llama_prism_hadamard` (`enabled` / `tied_output` / `block_size` / `signs[width]` / `fwd` / `inv`); **kept out of `llama_hparams`** because that struct must stay trivially copyable |
+| `src/llama-model.h` / `.cpp` | modified | `llama_model::prism` + `llama_load_prism_hadamard()`: parses and validates the metadata with the raw gguf API; anything unexpected only warns and disables the feature |
+| `src/llama-context.cpp` | modified | `graph_params()` passes `&model.prism` |
+| `src/llama-graph.h` / `.cpp` | modified | `llm_graph_input_prism` (constant rotation matrix + sign vectors), `build_inp_prism()` / `build_prism_rotate()` / `build_prism_embd()` / `build_prism_output()` / `has_prism_rot()`; hooked into `build_lora_mm()` and the token branch of `build_inp_embd()` |
+| `src/models/qwen35.cpp` / `qwen35moe.cpp` | modified | `build_inp_prism()` at graph construction; `build_prism_output()` before the tied head (incl. the MTP draft head) |
+| `CMakeLists.txt` / `tools/rpc/rpc-server.cpp` | modified | Build 32 -> 33 |
+
+The rotation reuses the engine's existing FWHT fast path (`GGML_HINT_SRC0_IS_HADAMARD` ->
+`ggml_compute_forward_fwht`): `O(n log n)` on CPU / Vulkan / CUDA / Metal / SYCL; backends without the hint
+fall back to a real matrix product (same result, slower). The rotation tensors are constant graph inputs
+copied once on the first `set_input`. **Models without the metadata are completely unaffected.**
+
+Implementation caveats (both were hit for real):
+
+1. **Graph input tensors must be re-filled on every ubatch.** The first version treated the rotation
+   matrix / sign vectors as constants and copied them only once per graph object - result: *prefill
+   correct, token-by-token generation broken from the first step* (the `ggml_backend_sched` allocator
+   recycles an input tensor's memory as soon as its last consumer has been computed). Symptoms:
+   `-ub 512` gets the first token right and then garbage; `perplexity -b 1` returns `nan`; batched
+   perplexity looks perfect (19.11 vs 1.8e6 for the wrong configuration). Fix: `set_input()` memcpy's
+   unconditionally (1 MB per step, negligible).
+2. **The tied output head has to be detected by tensor name** (`name in inverse_weight_names`), not by
+   comparing `model.output == model.tok_embd`. With `-ngl -1` the `TENSOR_DUPLICATED` output tensor is a
+   *different* `ggml_tensor` instance (symptom: CPU PPL 19.11 but Vulkan PPL 1,236,995).
+
+Measured (`wiki/Background.en.md`, `-c 512 --chunks 2`): this implementation gives **PPL 19.11**
+(identical on CPU and `-ngl -1` Vulkan); token-by-token (`-b 1 -ub 1`) gives **13.11**; swapping the
+sign/Hadamard order gives **1,801,563**; a wrong embedding/head direction gives 29,055 - 1,236,995.
+Generation is **identical for `-ub 1 / 2 / 4 / 512`** (`...France is` -> ` Paris.`; CLI `Hello` -> a
+coherent reasoning paragraph), and the mmproj turns a 768px image into 256 vision tokens and describes it
+correctly. Debug switches: `LUMINA_PRISM_DISABLE` / `LUMINA_PRISM_ORDER` / `LUMINA_PRISM_EMBD` /
+`LUMINA_PRISM_OUT` / `LUMINA_PRISM_NO_FWHT` / `LUMINA_PRISM_DEBUG` / `LUMINA_NO_FUSED_GDN`.
+Details in `HANDOFF.md` § Build 33.
+
+---
+
+## 0.1 Training progress bar loses `tok/s` (Build 32)
 
 Build 27 appended a live throughput field `%5.1f tok/s` to the training progress line. It was a
 **cumulative average over the whole pass**: the first micro-batches spend their time on disk reads and
@@ -31,7 +90,7 @@ only the `GGML_TYPE_Q1_0` + AVX2 path; on top of that there is the Q4_K decode-k
 
 ---
 
-## 0.1 Q4_K GEMV software prefetch (Build 31)
+## 0.2 Q4_K GEMV software prefetch (Build 31)
 
 CPU single-token generation spends almost all of its time in `ggml_gemv_q4_K_8x8_q8_K` (the repacked
 Q4_K decode kernel). On this machine that kernel only reaches 6.0-7.5 GB/s per thread while a plain
@@ -64,7 +123,7 @@ Correctness: the patched kernel produces **bit-identical** output to the previou
 greedy decoding (`--temp 0`) of the real engine yields exactly the same text as Build 30; all 7
 experimental variants match an independent scalar reference (`max_abs_err = 4.8e-07`, tolerance 2.9e-06).
 
-## 0.2 CLI multi-turn fix (Build 30)
+## 0.3 CLI multi-turn fix (Build 30)
 
 MoE chat answered `None` from the 2nd turn on: the CLI unconditionally appended the assistant message
 (possibly an empty string) to its history, so a turn that produced no visible output left a dangling
@@ -81,7 +140,7 @@ strict MoE chat templates made the model emit a placeholder token for good. Also
 Measured: `printf '你好\n1+1=?\n' | cli` produced an endless `> ` stream on Build 29
 (1,483,183 lines in 300 s) and exits normally with `Exiting...` (37 lines, exit 0) on Build 30.
 
-## 0.3 `--mask-history` training-path issue + normalisation (Build 29)
+## 0.4 `--mask-history` training-path issue + normalisation (Build 29)
 
 Measured: same token stream, `-c 4096`, per-batch loss ~11.9 with `--mask-history` vs ~1.47 with
 `--no-mask-history` (two runs each, bit-identical; labels verified correct; inference PPL of the same
@@ -94,7 +153,7 @@ text is 2.03). **Train with `--no-mask-history`.**
 | `tools/lumina-train/lumina-train.cpp` | modified | note about the `--mask-history` path and the recommended configuration |
 | `CMakeLists.txt` / `tools/rpc/rpc-server.cpp` | modified | Build 28 -> 29 |
 
-## 0.4 Training-loss reporting note (Build 28)
+## 0.5 Training-loss reporting note (Build 28)
 
 The progress-bar loss is a cumulative mean; the CE kernel averages over all rows while
 `ggml_opt_result_loss()` compensates with `ndata/nlabeled` (dataset points vs labelled rows - different
@@ -107,7 +166,7 @@ judge progress with `--dataset-val`.
 | `tools/lumina-train/lumina-train.cpp` | modified | removed the incorrect `-c > 2048` warning; added the `--mask-history` note |
 | `CMakeLists.txt` / `tools/rpc/rpc-server.cpp` | modified | Build 27 -> 28 |
 
-## 0.5 Disk-backed training dataset (Build 27)
+## 0.6 Disk-backed training dataset (Build 27)
 
 The trainer used to accumulate the entire dataset in two `std::vector`s
 (`int32` token ids + `uint8` trainability mask = **5 bytes per token**) and only then serialise it
@@ -130,7 +189,7 @@ byte-identical data:
 | Build 26 | 2074 MB | 29282 rec / 300,021,789 tok / 278,340 datapoints |
 | Build 27 | **645 MB** | identical |
 
-## 0.6 Training gradient-accumulator fix (Build 26)
+## 0.7 Training gradient-accumulator fix (Build 26)
 
 For the `llama-finetune` / `llama_opt_epoch()` path (`Lumina-Engine-train`) with
 `n_batch / n_ubatch > 1`, the old code never cleared the gradient accumulators: every optimizer
@@ -150,7 +209,7 @@ grew without bound and the loss climbed (approximately linearly).
 
 ---
 
-## 0.7 Unified console startup screen (Build 24)
+## 0.8 Unified console startup screen (Build 24)
 
 Every console tool now prints the same Lumina-Engine startup screen (ASCII logo + build number +
 project links):

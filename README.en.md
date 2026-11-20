@@ -2,9 +2,9 @@
 
 > 🌐 [中文](README.md) | **English**
 
-> A Windows x86-64 inference / compression / training engine built on llama.cpp b-10991: dedicated CPU kernels for **Bonsai Q1_0**, plus **Vulkan acceleration, automatic device policy, lossless compression, and QLoRA training** for a wider range of models.
+> A Windows x86-64 inference / compression / training engine built on llama.cpp b-10991: dedicated CPU kernels for **Bonsai Q1_0**, support for the **PrismML ternary (Q2_0) `prism.hadamard.*` weight rotation**, plus **Vulkan acceleration, automatic device policy, lossless compression, and QLoRA training** for a wider range of models.
 
-![Build](https://img.shields.io/badge/build-32-blue)
+![Build](https://img.shields.io/badge/build-33-blue)
 ![llama.cpp](https://img.shields.io/badge/llama.cpp-b10991-green)
 ![Platform](https://img.shields.io/badge/platform-Windows%20x86--64-lightgrey)
 ![License](https://img.shields.io/badge/license-AGPL--3.0-orange)
@@ -82,7 +82,7 @@ The upstream generic Q1_0 kernel converts to float every 32 weights and does not
 - **One package, 14 CPUs**: SSE4.2 / Sandy Bridge / Haswell / Skylake-X / Ice Lake / Alder Lake / Zen 4 / Sapphire Rapids… selected automatically via CPUID at runtime.
 - **Automatic CPU / GPU decisions**: pure CPU without a GPU; operator offload on integrated GPUs; full-layer offload on discrete GPUs; MoE models automatically avoid the "more offload, slower" trap.
 - **Lossless model compression**: the `.gguf.lumina` container separates the `d/dmin/scales` fields of Q4_K / Q6_K from the weight streams and then applies DEFLATE (F32 tensors are compressed separately). For `SmallThinker-4BA0.6B-Instruct.Q4_K_M.gguf`, 2.63 GB → 2.48 GB (**94.28%**), with a byte-identical SHA-256 after decompression.
-- **Built-in training engine**: `Lumina-Engine-train` performs **QLoRA** directly on Q4_K / Q8_0 / Q1_0 quantized models, with JSONL datasets, checkpoints, resume, MoE expert adapters, and long-context training on an 8 GB machine (attention recomputation during backward + dataset mmap; ~3.5 GiB at `-c 8192`, ~4.0 GiB at `-c 32768`, which is tight for 8 GB - see `HANDOFF.md` Build 30).
+- **Built-in training engine**: `Lumina-Engine-train` performs **QLoRA** directly on Q4_K / Q8_0 / Q1_0 / Q2_0 quantized models, with JSONL datasets, checkpoints, resume, MoE expert adapters, and long-context training on an 8 GB machine (attention recomputation during backward + dataset mmap; ~3.5 GiB at `-c 8192`, ~4.0 GiB at `-c 32768`, which is tight for 8 GB - see `HANDOFF.md` Build 30).
 - **One-command delivery**: `build-bin.bat` builds the MSVC + Clang trees and assembles the runtime directory; no manual DLL copying.
 
 ---
@@ -123,7 +123,7 @@ Not every change is 1-bit-only: the Q1_0 kernels are strictly isolated, while th
 | OS | Windows 10 / 11 x86-64 |
 | CPU | SSE4.2 required; **AVX2 recommended** (Haswell 2013+ / Zen+). VNNI / AVX-512 is faster |
 | RAM | ≥ 8 GB recommended for 8B models; 4 GB is enough for 1.7B |
-| Model | **Bonsai-8B GGUF (Q1_0)**, ~1.07 GiB. Download it yourself from [PrismML](https://prismml.com); it is not bundled. Other Q4_K / Q8_0 GGUF files also load directly |
+| Model | **Bonsai-8B GGUF (Q1_0)**, ~1.07 GiB. Download it yourself from [PrismML](https://prismml.com); it is not bundled. **Ternary-Bonsai-2-2B (`qwen35` + `Q2_0` + `prism.hadamard.*`) and its mmproj also load directly** (see [PrismML ternary models](#prismml-ternary-q2_0-models)); other Q4_K / Q8_0 GGUF files too |
 | Runtime | Inference needs **no Python / Node / CUDA**; the prebuilt package ships every DLL. The compression scripts require Python 3 |
 
 ### Option 1: use the prebuilt binaries (recommended)
@@ -283,6 +283,68 @@ The full three-stage pipeline is in **[TRAINING_PIPELINE.md](TRAINING_PIPELINE.m
 
 ---
 
+## PrismML ternary (Q2_0) models
+
+Since Build 33 the engine loads **PrismML Bonsai ternary models** that carry `prism.hadamard.*` metadata,
+e.g. `Ternary-Bonsai-2-2B-Q2_0.gguf` (`qwen35` architecture, `Q2_0` ternary quantization, ~2.1 bit/weight)
+and its multimodal projector `Ternary-Bonsai-2-2B-mmproj-Q8_0.gguf`.
+
+```bat
+cd /d C:\Lumina-Engine\Lumina-Engine-Bin
+
+REM text
+Lumina-Engine-cli.exe -m ..\Ternary-Bonsai-2-2B-Q2_0.gguf -p "The capital of France is" -n 32 -t 6
+
+REM multimodal (mmproj)
+Lumina-Engine-mtmd-cli.exe -m ..\Ternary-Bonsai-2-2B-Q2_0.gguf ^
+    --mmproj ..\Ternary-Bonsai-2-2B-mmproj-Q8_0.gguf ^
+    --image ..\test.png -p "Describe this image." -n 64 -t 6
+```
+
+Those weights are stored *rotated* (`W' = W · R`, `R` = block-512 normalized Sylvester–Hadamard composed
+with explicit ±1 signs), so inference has to rotate each activation back into the weight basis before the
+matmul. The engine reads everything from the GGUF metadata:
+
+| Metadata | Purpose |
+|---|---|
+| `prism.hadamard.block_size` | rotation block size (512 in this model) |
+| `prism.hadamard.sign_widths` / `sign_values` | one ±1 vector per input width (`2048` / `6144`, 8192 values) |
+| `prism.hadamard.weight_names` | quantized weights whose **input** must be rotated (150 of them) |
+| `prism.hadamard.inverse_weight_names` | weights that go through a lookup (`token_embd.weight`) → **inverse** transform after the lookup |
+| `prism.hadamard.tied_output` | the head shares the embedding tensor → **forward** transform before the head |
+
+The rotation reuses the engine's FWHT fast path (`GGML_HINT_SRC0_IS_HADAMARD`): `O(n log n)` per row on
+CPU / Vulkan / CUDA / Metal / SYCL, and a plain (slower) matrix product on backends without the hint.
+**Models without this metadata behave exactly as before** — every code path is gated by `prism.enabled`.
+
+Measured here (i5-10400 / 8 GB, pure CPU `-t 6`, `wiki/Background.en.md`, `-c 512 --chunks 2`):
+
+| Configuration | PPL |
+|---|---|
+| This implementation (`hd` + `embd=inv` + `out=fwd`; CPU == `-ngl -1` Vulkan) | **19.11** |
+| Token-by-token (`-b 1 -ub 1`, `-c 256`) | **13.11** |
+| Signs and Hadamard swapped (`LUMINA_PRISM_ORDER=dh`) | 1,801,563 |
+| Wrong embedding / head direction | 29,055 – 1,236,995 |
+
+Generation side (`-ub 1 / 2 / 4 / 512` give identical results):
+
+```text
+The capital of France is          ->  Paris.
+... The capital of Italy is       ->  Rome. The capital of Spain ...
+Hello (CLI chat)                  ->  Okay, the user just said "Hello". That's a straightforward
+                                      greeting. I should respond warmly and invite them to ask ...
+mmproj + 768px image              ->  I see two primary shapes. A large red circle in the upper ...
+```
+
+The mmproj (`qwen3vl_merger`) turns a 768px image into 256 vision tokens in ~10-12 s.
+See `HANDOFF.md` § Build 33 for the full A/B matrix and the two pitfalls hit on the way.
+
+> `Q2_0` is ternary (one fp16 scale per 64 weights); this 2B model really is around PPL ≈ 19.
+> Debug switches: `LUMINA_PRISM_DISABLE=1` (no rotation, reproduces the old garbage),
+> `LUMINA_PRISM_DEBUG=1`, `LUMINA_PRISM_NO_FWHT=1`, `LUMINA_NO_FUSED_GDN=1`.
+
+---
+
 ## Benchmarks
 
 > The data below covers the **Q1_0-specific path**. See [Optimization scope](#optimization-scope) for Vulkan, multi-CPU-variant, training, and compression gains.
@@ -410,6 +472,13 @@ Build trees, artifact layout, and troubleshooting: [wiki/Building.en.md](wiki/Bu
 | `LUMINA_Q1_VK_INT8=1` | off | Experimental int8 prefill path |
 | `LUMINA_TRAIN_ALLOW_GPU=1` | off | Allow training on GPU (experimental, not recommended) |
 | `LUMINA_OP_PROF=1` | off | Print training operator time profile |
+| `LUMINA_PRISM_DISABLE=1` | off | Disable the `prism.hadamard.*` weight rotation (reproduces the pre-Build-33 garbage output; debugging) |
+| `LUMINA_PRISM_ORDER=hd\|dh` | `hd` | Rotation order: `H(diag(s)·x)` (default, measured correct) / `diag(s)·H(x)` |
+| `LUMINA_PRISM_EMBD=inv\|fwd\|none` | `inv` | Transform applied to the token-embedding lookup output |
+| `LUMINA_PRISM_OUT=fwd\|inv\|none` | `fwd` | Transform applied before the tied output head |
+| `LUMINA_PRISM_NO_FWHT=1` | off | Skip the FWHT fast path and use a real `512x512` matmul (debugging / A-B) |
+| `LUMINA_PRISM_DEBUG=1` | off | Print rotation bookkeeping (rotated weights + shapes, constant refills), needs `-v` |
+| `LUMINA_NO_FUSED_GDN=1` | off | Disable the fused gated delta net (fall back to the chunked / autoregressive graph) |
 
 ---
 
@@ -479,7 +548,7 @@ The repository does not bundle models. Get the Bonsai GGUF (Q1_0) series from [P
 The source is cross-platform, but the prebuilt delivery and performance testing here focus on Windows x86-64; on Linux, build it yourself with CMake.
 
 **Can I fine-tune a 1-bit model?**
-Yes. The quantized base stays frozen and only LoRA adapters are trained (QLoRA), supporting Q1_0 / Q4_K / Q8_0 and MoE.
+Yes. The quantized base stays frozen and only LoRA adapters are trained (QLoRA), supporting Q1_0 / Q2_0 (ternary) / Q4_K / Q8_0 and MoE (including PrismML `prism.hadamard.*` rotated models, verified in Build 33).
 
 **Are these optimizations 1-bit-only?**
 No. The Q1_0-specific kernels only affect 1-bit models; the 14 CPU variants, Vulkan, automatic device policy, lossless compression, and QLoRA training all apply to other models / quantization types. See [Optimization scope](#optimization-scope).
@@ -490,7 +559,8 @@ No. The Q1_0-specific kernels only affect 1-bit models; the 14 CPU variants, Vul
 
 | Build | Highlights |
 |------:|------------|
-| **32** | Removed the misleading `tok/s` field from the training progress line (a cumulative average that also counted fully masked prompt micro-batches and the initial disk reads; it drifted 14→26 within one run); verified Build 30/31/32 train **bit-identically** (same adapter SHA-256) |
+| **33** | Support for the **PrismML `prism.hadamard.*` weight rotation** (Ternary-Bonsai-2-2B-Q2_0 / `qwen35`): every rotated quantized weight gets its activation rotated with a block-512 normalized Sylvester–Hadamard plus explicit ±1 signs, the token-embedding lookup is un-rotated, the tied output head is rotated; reuses the existing FWHT fast path, zero impact on other models; mmproj (`qwen3vl_merger`) works |
+| 32 | Removed the misleading `tok/s` field from the training progress line (a cumulative average that also counted fully masked prompt micro-batches and the initial disk reads; it drifted 14→26 within one run); verified Build 30/31/32 train **bit-identically** (same adapter SHA-256) |
 | 31 | Faster CPU decoding: software prefetch in the repacked Q4_K GEMV kernel, **+13%** single-token generation on CPU (bit-identical output); added a reproducible kernel-level A/B benchmark (`tests/bench-cpu-kern.cpp`) |
 | 30 | CLI multi-turn fix: empty replies are no longer stored in the chat history (root cause of MoE models answering `None` from the 2nd turn on); exit on stdin EOF instead of spinning; `[End thinking]` is now closed every turn |
 | 29 | Located the broken `--mask-history` training path (use `--no-mask-history`); loss/accuracy normalisation made explicit |

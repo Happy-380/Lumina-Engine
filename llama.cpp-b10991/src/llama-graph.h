@@ -156,6 +156,31 @@ public:
     const int64_t n_embd = 0;
 };
 
+// constant inputs of the prism.hadamard.* incoherence rotation (see llama_prism_hadamard):
+// the normalized block Hadamard matrix and the per-width sign vectors
+class llm_graph_input_prism : public llm_graph_input_i {
+public:
+    explicit llm_graph_input_prism(const llama_prism_hadamard & prism) : prism(prism) {}
+    ~llm_graph_input_prism() override = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override {
+        GGML_UNUSED(params);
+        // the tensors are constant - they only depend on the metadata
+        return true;
+    }
+
+    ggml_tensor * rot = nullptr;                  // F32 [block_size, block_size]
+    std::map<int64_t, ggml_tensor *> signs;       // width -> F32 [width]
+
+    std::vector<float> rot_data;                  // host copy of the normalized Hadamard matrix
+
+    const llama_prism_hadamard prism;
+
+
+};
+
 class llm_graph_input_pos : public llm_graph_input_i {
 public:
     llm_graph_input_pos(uint32_t n_pos_per_embd) : n_pos_per_embd(n_pos_per_embd) {}
@@ -775,6 +800,9 @@ struct llm_graph_params {
     llama_hparams hparams;
     llama_cparams cparams;
 
+    // prism.hadamard.* incoherence rotation of the model (nullptr when not used)
+    const llama_prism_hadamard * prism = nullptr;
+
     llama_ubatch ubatch; // note: intentionally make a copy
 
     llm_graph_type gtype;
@@ -988,6 +1016,9 @@ struct llm_graph_context {
     const llama_cparams & cparams;
     const llama_ubatch  & ubatch;
 
+    // prism.hadamard.* incoherence rotation (nullptr when the model does not use it)
+    const llama_prism_hadamard * prism = nullptr;
+
     const int64_t n_embd;
     const int64_t n_layer;
     const int64_t n_layer_nextn;
@@ -1054,6 +1085,34 @@ struct llm_graph_context {
               ggml_tensor * w,
               ggml_tensor * cur,
               ggml_tensor * w_s = nullptr) const;
+
+    // prism.hadamard.* incoherence rotation (no-op for every model without the metadata)
+    // creates the constant rotation inputs; must be called before the first build_lora_mm()
+    void build_inp_prism() const;
+
+    // apply the prism rotation to an activation (n == ne[0] of the rotated weight);
+    // inverse == true applies R^-1 (used for the token embedding lookup)
+    ggml_tensor * build_prism_rotate(
+              ggml_tensor * cur,
+                  int64_t   n,
+                     bool   inverse) const;
+
+    // token embedding lookup output: applies R^-1 when the embedding is a rotated weight
+    ggml_tensor * build_prism_embd(
+              ggml_tensor * cur,
+        const ggml_tensor * tok_embd) const;
+
+    // input of the output head: applies R when the head is the (rotated) token embedding
+    ggml_tensor * build_prism_output(
+              ggml_tensor * cur,
+        const ggml_tensor * head,
+        const ggml_tensor * tok_embd) const;
+
+    // true if the prism rotation is active and the given tensor is a rotated weight
+    bool has_prism_rot(const ggml_tensor * w) const;
+
+    mutable ggml_tensor * prism_rot = nullptr;                     // F32 [block, block]
+    mutable std::map<int64_t, ggml_tensor *> prism_signs;          // width -> F32 [width]
 
     // do mat_mul_id, while optionally apply lora and per-expert scale
     ggml_tensor * build_lora_mm_id(
@@ -1162,8 +1221,7 @@ struct llm_graph_context {
     //
 
     ggml_tensor * build_inp_embd(ggml_tensor * tok_embd) const;
-    ggml_tensor * build_inp_pos() const;
-    ggml_tensor * build_inp_attn_scale() const;
+    ggml_tensor * build_inp_pos() const;    ggml_tensor * build_inp_attn_scale() const;
     ggml_tensor * build_inp_out_ids() const;
     ggml_tensor * build_inp_mean() const;
     ggml_tensor * build_inp_cls() const;
